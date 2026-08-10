@@ -1,0 +1,36 @@
+name: marineford_cli
+description: >-
+  Command line tool for marineford. Generates signing keys, compiles and
+  signs patches, lints them against the measured cost model, and publishes them
+  to a local folder or any S3-compatible object storage.
+version: 0.1.0-dev
+repository: https://github.com/yusufkecer/marineford/tree/main/packages/marineford_cli
+issue_tracker: https://github.com/yusufkecer/marineford/issues
+topics:
+  - code-push
+  - ota
+  - cli
+  - patching
+
+environment:
+  sdk: ^3.6.0
+
+resolution: workspace
+
+executables:
+  marineford: marineford
+  mf: marineford
+
+dependencies:
+  args: ^2.6.0
+  crypto: ^3.0.6
+  dart_eval: ^0.8.5
+  http: ^1.2.0
+  marineford_core: ^0.1.0-dev
+  path: ^1.9.0
+  pub_semver: ^2.1.5
+  yaml: ^3.1.2
+
+dev_dependencies:
+  lints: ^6.0.0
+  test: ^1.25.0
