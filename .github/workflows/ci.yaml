@@ -23,8 +23,18 @@ jobs:
       - name: Resolve workspace
         run: flutter pub get
 
+      # Before generating, so this only judges code a human wrote. Generated
+      # files are gitignored and the generator's formatter does not always agree
+      # with `dart format` to the character.
       - name: Format
         run: dart format --set-exit-if-changed .
+
+      # The example's shims and ABI fingerprint are generated and gitignored, so
+      # a fresh checkout does not have them and everything downstream — analyze,
+      # the example's tests — fails without this step.
+      - name: Generate
+        run: dart run build_runner build
+        working-directory: example/json_drift_app
 
       - name: Analyze
         run: flutter analyze
