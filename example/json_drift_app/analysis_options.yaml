@@ -1,0 +1,11 @@
+include: ../../analysis_options.yaml
+
+analyzer:
+  # The patch package is dart_eval source, not Dart the SDK will ever compile.
+  # It declares its own @RuntimeOverride and uses raw Map/List on purpose,
+  # because that is what the interpreter accepts. Analysing it as normal Dart
+  # produces noise about code that is correct for its actual target.
+  exclude:
+    - patch/**
+  errors:
+    public_member_api_docs: ignore

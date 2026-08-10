@@ -1,0 +1,29 @@
+name: json_drift_app
+description: >-
+  Shows marineford repairing a backend contract change on an already-shipped
+  build, without a store release.
+publish_to: none
+version: 1.4.0
+
+environment:
+  flutter: ">=3.27.0"
+  sdk: ^3.6.0
+
+resolution: workspace
+
+dependencies:
+  flutter:
+    sdk: flutter
+  marineford: ^0.1.0-dev
+  marineford_annotation: ^0.1.0-dev
+  marineford_core: ^0.1.0-dev
+  pub_semver: ^2.1.5
+
+dev_dependencies:
+  build_runner: ">=2.15.0 <2.15.2"
+  flutter_test:
+    sdk: flutter
+  lints: ^6.0.0
+  marineford_cli: ^0.1.0-dev
+  marineford_gen: ^0.1.0-dev
+  path: ^1.9.0

@@ -1,0 +1,5 @@
+app_id: com.example.jsondrift
+channel: prod
+patch_package: patch
+app_package: .
+size_budget_kb: 64
