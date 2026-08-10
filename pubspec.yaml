@@ -1,0 +1,21 @@
+name: _marineford_workspace
+description: >-
+  Workspace root for marineford. Not published — see packages/ for the
+  publishable packages.
+publish_to: none
+
+environment:
+  sdk: ^3.6.0
+
+workspace:
+  - packages/marineford_annotation
+  - packages/marineford_core
+  - packages/marineford
+  - packages/marineford_gen
+  - packages/marineford_cli
+  - example/json_drift_app
+  - bench
+
+dev_dependencies:
+  lints: ^6.0.0
+  test: ^1.25.0

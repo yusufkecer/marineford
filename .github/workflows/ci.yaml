@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Resolve workspace
+        run: flutter pub get
+
+      - name: Format
+        run: dart format --set-exit-if-changed .
+
+      - name: Analyze
+        run: flutter analyze
+
+      # Pure-Dart packages run under `dart test`. marineford_gen has to: build_test
+      # drives build_runner, which needs the Dart VM's own package resolution
+      # and cannot write assets inside the Flutter test harness.
+      - name: Test (Dart packages)
+        run: dart test packages/marineford_core packages/marineford_annotation packages/marineford_gen packages/marineford_cli
+
+      - name: Test (Flutter runtime)
+        run: flutter test packages/marineford example/json_drift_app
+
+  # The design rests on a handful of specific costs, so they are measured
+  # rather than remembered. Budgets are loose enough to tolerate a slow runner
+  # and tight enough to catch an order-of-magnitude regression.
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      # AOT, not JIT: the JIT numbers describe nothing that ships, and the
+      # benchmark refuses to check budgets under it.
+      - run: dart compile exe bench/bin/run.dart -o bench/run
+      - run: ./bench/run --check

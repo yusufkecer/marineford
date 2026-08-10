@@ -1,0 +1,37 @@
+# Dart / Flutter
+.dart_tool/
+.packages
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+plan.md
+# Workspace members do not carry their own lockfile; the root one is committed.
+packages/*/pubspec.lock
+
+# Generated
+*.g.dart
+*.marineford.dart
+*.eval.dart
+marineford_ids.json
+
+# Patch artifacts
+*.evc
+*.mfp
+out/
+
+# Signing keys — NEVER commit these. `marineford init` adds them here too.
+*.pem
+*.key
+marineford_private_key*
+.marineford/secrets/
+
+# Editors / OS
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Compiled benchmark
+bench/run
+bench/run.exe

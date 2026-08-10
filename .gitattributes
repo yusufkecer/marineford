@@ -1,0 +1,12 @@
+# CI, `dart format --set-exit-if-changed` komutunu Linux'ta çalıştırıyor.
+# Windows'ta CRLF ile checkout edilen dosyalar orada "değişmiş" görünüp
+# build'i kırar. Metin dosyalarını depoda ve çalışma kopyasında LF'te tut.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary
+*.ttf binary
+*.otf binary
+*.evc binary
+*.ddm binary
