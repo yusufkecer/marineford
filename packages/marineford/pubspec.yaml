@@ -1,0 +1,36 @@
+name: marineford
+description: >-
+  Code push for Flutter without forking the engine. Mark the functions you want
+  to be able to fix later, ship a signed patch to any CDN, and repair broken
+  logic without a store release.
+version: 0.1.0-dev
+repository: https://github.com/yusufkecer/marineford/tree/main/packages/marineford
+issue_tracker: https://github.com/yusufkecer/marineford/issues
+topics:
+  - code-push
+  - ota
+  - hot-update
+  - patching
+
+environment:
+  flutter: ">=3.27.0"
+  sdk: ^3.6.0
+
+resolution: workspace
+
+dependencies:
+  dart_eval: ^0.8.5
+  flutter:
+    sdk: flutter
+  http: ^1.2.0
+  marineford_annotation: ^0.1.0-dev
+  marineford_core: ^0.1.0-dev
+  meta: ^1.15.0
+  path: ^1.9.0
+  path_provider: ^2.1.4
+  pub_semver: ^2.1.5
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  lints: ^6.0.0

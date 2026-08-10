@@ -1,0 +1,142 @@
+import 'package:dart_eval/dart_eval.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:marineford/marineford.dart';
+import 'package:pub_semver/pub_semver.dart';
+
+/// Pins down which argument forms dart_eval accepts for which parameter types.
+///
+/// This is not testing our code so much as testing an assumption our code
+/// generator is built on. If dart_eval ever changes how it boxes parameters,
+/// every generated shim silently starts passing the wrong thing — and the
+/// symptom is a patch that quietly falls back, not an error. Better to find out
+/// here.
+void main() {
+  late Runtime runtime;
+
+  setUpAll(() {
+    // Every function here uses its parameter. That is load-bearing: with an
+    // unused parameter dart_eval never emits the box/unbox opcode, every form
+    // appears to work, and the test proves nothing.
+    const source = r'''
+class RuntimeOverride {
+  const RuntimeOverride(this.id, {this.version});
+  final String id;
+  final String? version;
+}
+@RuntimeOverride('#int', version: '>=1.0.0') String fi(int v) { return 'ok:$v'; }
+@RuntimeOverride('#double', version: '>=1.0.0') String fd(double v) { return 'ok:$v'; }
+@RuntimeOverride('#bool', version: '>=1.0.0') String fb(bool v) { return 'ok:$v'; }
+@RuntimeOverride('#intN', version: '>=1.0.0') String fin(int? v) { return 'ok:$v'; }
+@RuntimeOverride('#doubleN', version: '>=1.0.0') String fdn(double? v) { return 'ok:$v'; }
+@RuntimeOverride('#boolN', version: '>=1.0.0') String fbn(bool? v) { return 'ok:$v'; }
+@RuntimeOverride('#string', version: '>=1.0.0') String fs(String v) { return 'ok:$v'; }
+@RuntimeOverride('#stringN', version: '>=1.0.0') String fsn(String? v) { return 'ok:$v'; }
+@RuntimeOverride('#num', version: '>=1.0.0') String fn(num v) { return 'ok:$v'; }
+@RuntimeOverride('#object', version: '>=1.0.0') String fo(Object v) { return 'ok:$v'; }
+''';
+    final program = Compiler().compile({
+      'p': {'main.dart': source},
+    });
+    runtime = Runtime(program.write().buffer.asByteData())
+      ..loadGlobalOverrides();
+  });
+
+  setUp(() {
+    Patch.activate(runtime, resolveSlots(runtime, Version.parse('1.0.0')),
+        failureThreshold: 9999);
+  });
+
+  tearDown(Patch.resetForTesting);
+
+  bool accepts(String id, Object? argument) =>
+      Patch.invoke1(Patch.slot(id)!, argument) != null;
+
+  group('non-nullable int, double and bool are unboxed', () {
+    test('raw values are accepted', () {
+      expect(accepts('#int', 42), isTrue);
+      expect(accepts('#double', 1.5), isTrue);
+      expect(accepts('#bool', true), isTrue);
+    });
+
+    test('wrapped values are rejected', () {
+      expect(accepts('#int', MarinefordJson.wrap(42)), isFalse);
+      expect(accepts('#double', MarinefordJson.wrap(1.5)), isFalse);
+      expect(accepts('#bool', MarinefordJson.wrap(true)), isFalse);
+    });
+  });
+
+  group('making a primitive nullable flips the rule', () {
+    test('wrapped values are accepted', () {
+      expect(accepts('#intN', MarinefordJson.wrap(42)), isTrue);
+      expect(accepts('#doubleN', MarinefordJson.wrap(1.5)), isTrue);
+      expect(accepts('#boolN', MarinefordJson.wrap(true)), isTrue);
+    });
+
+    test('raw values are rejected', () {
+      // The nastiest case in the table: `int` and `int?` need opposite
+      // treatment, so adding a `?` to a patch parameter breaks the shim unless
+      // the generator re-reads the type.
+      expect(accepts('#intN', 42), isFalse);
+      expect(accepts('#doubleN', 1.5), isFalse);
+      expect(accepts('#boolN', true), isFalse);
+    });
+  });
+
+  group('everything else is boxed', () {
+    test('wrapped values are accepted', () {
+      expect(accepts('#string', MarinefordJson.wrap('x')), isTrue);
+      expect(accepts('#stringN', MarinefordJson.wrap('x')), isTrue);
+      expect(accepts('#num', MarinefordJson.wrap(7)), isTrue);
+      expect(accepts('#object', MarinefordJson.wrap('x')), isTrue);
+    });
+
+    test('raw values are rejected', () {
+      expect(accepts('#string', 'x'), isFalse);
+      expect(accepts('#num', 7), isFalse);
+      expect(accepts('#object', 'x'), isFalse);
+    });
+  });
+
+  group('MarinefordJson round trip', () {
+    test('nested maps and lists survive both directions', () {
+      final original = <String, dynamic>{
+        'status': 'ok',
+        'count': 3,
+        'ratio': 0.5,
+        'flag': true,
+        'nothing': null,
+        'days': <dynamic>['Pazartesi', 'Salı'],
+        'data': <String, dynamic>{
+          'nested': <dynamic>[
+            1,
+            <String, dynamic>{'deep': 'yes'}
+          ],
+        },
+      };
+      expect(MarinefordJson.unwrap(MarinefordJson.wrap(original)), original);
+    });
+
+    test('unwrapMap rejects a non-map so the caller can fall back', () {
+      expect(MarinefordJson.unwrapMap(MarinefordJson.wrap(<dynamic>[1, 2])),
+          isNull);
+      expect(MarinefordJson.unwrapMap(MarinefordJson.wrap('nope')), isNull);
+      expect(
+          MarinefordJson.unwrapMap(
+              MarinefordJson.wrap(<String, dynamic>{'a': 1})),
+          <String, dynamic>{'a': 1});
+    });
+
+    test('unwrapList rejects a non-list', () {
+      expect(
+          MarinefordJson.unwrapList(MarinefordJson.wrap(<String, dynamic>{})),
+          isNull);
+      expect(MarinefordJson.unwrapList(MarinefordJson.wrap(<dynamic>[1, 2])),
+          [1, 2]);
+    });
+
+    test('non-JSON values pass through wrap untouched', () {
+      final sentinel = Object();
+      expect(identical(MarinefordJson.wrap(sentinel), sentinel), isTrue);
+    });
+  });
+}
