@@ -1,0 +1,29 @@
+name: marineford_core
+description: >-
+  Pure-Dart core for marineford: patch manifest parsing, signature and hash
+  verification, patch selection, staged rollout bucketing and ABI matching.
+  Shared by the runtime and the CLI so both sides agree on the rules.
+version: 0.1.0-dev
+repository: https://github.com/yusufkecer/marineford/tree/main/packages/marineford_core
+issue_tracker: https://github.com/yusufkecer/marineford/issues
+topics:
+  - code-push
+  - ota
+  - patching
+
+environment:
+  sdk: ^3.6.0
+
+resolution: workspace
+
+dependencies:
+  crypto: ^3.0.6
+  # Ed25519. pointycastle 4.0.0'da Ed25519 yok, ed25519_edwards 2021'den beri
+  # guncellenmemis. Olculen AOT binary maliyeti: +128 KB.
+  cryptography: ^2.9.0
+  meta: ^1.15.0
+  pub_semver: ^2.1.5
+
+dev_dependencies:
+  lints: ^6.0.0
+  test: ^1.25.0
