@@ -1,0 +1,17 @@
+builders:
+  marineford_shim:
+    import: "package:marineford_gen/builder.dart"
+    builder_factories: ["marinefordShimBuilder"]
+    build_extensions: {".dart": [".marineford.dart"]}
+    auto_apply: dependents
+    build_to: source
+    applies_builders: ["source_gen|combining_builder"]
+  marineford_abi:
+    import: "package:marineford_gen/builder.dart"
+    builder_factories: ["marinefordAbiBuilder"]
+    build_extensions:
+      $lib$: ["marineford.g.dart"]
+      $package$: ["marineford_ids.json"]
+    auto_apply: dependents
+    build_to: source
+    required_inputs: [".marineford.dart"]
