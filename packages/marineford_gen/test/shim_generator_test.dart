@@ -209,6 +209,35 @@ int visible(int v) => v;
 ''');
       expect(error, contains('must be private'));
     });
+
+    test('caches its slot behind the generation counter', () async {
+      // Without the cache, a marked function that is not itself patched pays a
+      // string hash and a map probe on every call for as long as any patch is
+      // live anywhere in the app — which, for a code-push system, is the
+      // steady state rather than the exception. Measured at 8.9ns against
+      // 4.5ns in `bench/`.
+      final output = await generate('''
+$_imports
+@patchable
+int _price(int v) => v;
+
+@patchable
+int _tax(int v) => v;
+''');
+
+      expect(collapse(output), contains(collapse(r'''
+  if (_mfGeneration$price != Patch.generation) {
+    _mfGeneration$price = Patch.generation;
+    _mfSlot$price = Patch.slot(r'pkg:app/lib/pricing.dart#price');
+  }
+''')));
+      // One pair of statics per function, named after it, so two marked
+      // functions in the same library cannot share a cache.
+      expect(output, contains(r'int? _mfSlot$price;'));
+      expect(output, contains(r'int _mfGeneration$price = -1;'));
+      expect(output, contains(r'int? _mfSlot$tax;'));
+      expect(output, contains(r'int _mfGeneration$tax = -1;'));
+    });
   });
 
   group('unsupported types produce a build error, not a broken shim', () {

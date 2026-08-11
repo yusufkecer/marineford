@@ -24,7 +24,7 @@ const String abiMarker = 'MARINEFORD-ABI: ';
 /// changes, patches built against the old one are not safe to load even though
 /// every user-visible signature is identical. Bump this whenever the emitted
 /// call sequence changes.
-const int kShimContractVersion = 1;
+const int kShimContractVersion = 2;
 
 /// Local variable names the generated shims use.
 ///
@@ -173,13 +173,28 @@ final class ShimGenerator extends Generator {
       origin: '$libraryId $publicName()',
     ));
 
+    // Cached the same way a service caches its methods. Without it, a marked
+    // function that is not itself patched pays a string hash and a map probe on
+    // every call for as long as *any* patch is live — which, for a code-push
+    // system, is the normal state of a shipped app. Measured at 8.9ns against
+    // 4.5ns; see `bench/`.
+    final slotField = '_mfSlot\$$publicName';
+    final generationField = '_mfGeneration\$$publicName';
+
     return '''
+int? $slotField;
+int $generationField = -1;
+
 /// Generated dispatch shim for [$privateName].
 ///
 /// Calls the patched implementation of `$id` when one is live, and
 /// `$privateName` otherwise.
 ${signature.returnDisplay} $publicName(${signature.declaration}) {
-${_body(id, signature, '$privateName(${signature.forwarding})')}
+  if ($generationField != Patch.generation) {
+    $generationField = Patch.generation;
+    $slotField = Patch.slot(r'$id');
+  }
+${_body(id, signature, '$privateName(${signature.forwarding})', slotExpression: slotField)}
 }
 ''';
   }
@@ -356,14 +371,12 @@ ${overrides.toString().trimRight()}
 
   /// The shared shim body: check, dispatch, unwrap, fall back.
   String _body(String id, _Signature signature, String fallback,
-      {String? slotExpression}) {
+      {required String slotExpression}) {
     final lines = StringBuffer();
-    // A service caches its slot in a field and hands the expression in; a
-    // top-level function looks it up here. Either way the hot path ends up as
-    // one read and one null check.
-    lines.writeln(slotExpression == null
-        ? "    final $_slotVar = Patch.slot(r'$id');"
-        : '    final $_slotVar = $slotExpression;');
+    // The caller has already refreshed the cache — a service in `_mfSync`, a
+    // top-level function inline — so the hot path here is one read and one null
+    // check, whether or not a patch is live.
+    lines.writeln('    final $_slotVar = $slotExpression;');
     lines.writeln('    if ($_slotVar != null) {');
     lines.writeln(
         '      final $_resultVar = ${signature.invocation(_slotVar, id)};');

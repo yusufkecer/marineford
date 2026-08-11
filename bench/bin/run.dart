@@ -131,6 +131,38 @@ Object? _naiveLookup(String id, List<Object?> args) {
   return args.length;
 }
 
+/// Stands in for `Patch.generation`, which a real shim compares against.
+int _generation = 0;
+
+int _cachedGeneration = -1;
+int? _cachedSlot;
+
+/// The same shim with its lookup cached against the generation counter.
+///
+/// This is what a `@PatchableService` method already does — the question this
+/// measures is whether a top-level function should do it too.
+int _cachedShim(int a, int b) {
+  if (_cachedGeneration != _generation) {
+    _cachedGeneration = _generation;
+    _cachedSlot = _slot('bench#add');
+  }
+  if (_cachedSlot != null) return 0;
+  return _native(a, b);
+}
+
+/// A slot table the size a real app's would be.
+///
+/// Measuring against a one-entry map would flatter the lookup: hashing the key
+/// costs the same either way, but collision behaviour and cache locality do
+/// not, and an app with one patchable function is not the app anyone has.
+Map<String, int> _realisticSlots() => <String, int>{
+      for (var i = 0; i < 24; i++) 'package:app/service_$i.dart#method$i': i,
+      // Present, but not the id the shim asks for. What matters here is the
+      // cost of a *miss* while some other function is patched: that is what
+      // every marked-but-unpatched function in the app pays.
+      'package:app/pricing.dart#total': 99,
+    };
+
 List<_Result> _dispatchCosts() {
   stdout.writeln('Measuring dispatch overhead...');
   _slots = null;
@@ -140,6 +172,18 @@ List<_Result> _dispatchCosts() {
   final native = _timeNs(iterations, () => sink += _native(2, 3));
   final guarded = _timeNs(iterations, () => sink += _guardedShim(2, 3));
   final naive = _timeNs(iterations, () => sink += _naiveShim(2, 3));
+
+  // Now with a patch live. Not a patch on *this* function — the interesting
+  // case is the other marked functions in the app, which keep running their
+  // original bodies but stop short-circuiting on the null table and start
+  // paying a full string hash and map probe on every call.
+  _slots = _realisticSlots();
+  _generation++;
+  final missGuarded = _timeNs(iterations, () => sink += _guardedShim(2, 3));
+  final missCached = _timeNs(iterations, () => sink += _cachedShim(2, 3));
+  _slots = null;
+  _generation++;
+
   if (sink == 0) throw StateError('optimised away');
 
   return <_Result>[
@@ -147,6 +191,9 @@ List<_Result> _dispatchCosts() {
     _Result('marked call, no patch (generated shim)', guarded, 'ns',
         budget: 15),
     _Result('marked call, no patch (naive, for contrast)', naive, 'ns'),
+    _Result('marked call, another patch live (map lookup)', missGuarded, 'ns'),
+    _Result('marked call, another patch live (cached slot)', missCached, 'ns',
+        budget: 15),
   ];
 }
 

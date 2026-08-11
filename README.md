@@ -37,8 +37,10 @@ workable, and understanding them is most of understanding the library:
    calls — it simply stops calling them. You never have to predict which leaf
    will break, only which entry point sits above it.
 
-2. **Marking is close to free.** A marked call with no patch active measures **~4 ns** against **~2 ns** unmarked. Mark whole categories, not
-   individual suspects.
+2. **Marking is close to free.** A marked call measures **~4 ns** against
+   **~2 ns** unmarked, and stays there whether or not a patch is live — every
+   shim caches its dispatch slot against a generation counter rather than
+   looking it up by name. Mark whole categories, not individual suspects.
 
 3. **One chokepoint covers an enormous amount.** A single marked normaliser on
    your HTTP client's output can absorb renamed fields, changed status values,
@@ -325,8 +327,8 @@ be:
 @PatchableService(exclude: ['pricePerFrame'])
 ```
 
-The generated class caches its slot lookups behind a generation counter, so the
-per-call cost is an integer compare rather than a map lookup.
+Like every shim, the generated class caches its slot lookups behind a generation
+counter, so the per-call cost is an integer compare rather than a map lookup.
 
 ### Where **not** to mark
 

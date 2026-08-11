@@ -24,7 +24,17 @@ Each number justifies a decision that would be wrong if it moved:
 | Measurement | What it decides |
 |---|---|
 | marked call, no patch | whether marking liberally is affordable |
+| marked call, another patch live | whether shims must cache their slot |
 | crossing into the interpreter | how coarse a patch boundary has to be |
 | interpreted loop iteration | why the linter warns about loops in patches |
 | activation | whether a patch can be applied on the startup path |
 | packed payload | whether shipping whole programs beats binary diffing |
+
+This last one exists because the measurement contradicted the assumption. The
+"marked calls are ~4ns" claim was only ever measured with *no* patch anywhere in
+the app, where the shim short-circuits on a null table. Once anything is
+patched, an unpatched marked function was paying a full string hash and map
+probe — 8.9ns — and a code-push system spends most of its life with something
+patched. Generated shims now cache the lookup against a generation counter,
+which brings it back to 4.5ns and makes it independent of how long the id is and
+how many functions are marked.

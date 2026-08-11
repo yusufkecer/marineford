@@ -40,21 +40,38 @@ final class Patch {
   static int _failureThreshold = 5;
   static PatchFailureHandler? _onFailure;
 
-  static final ValueNotifier<int> _generation = ValueNotifier<int>(0);
+  static int _generation = 0;
+  static final ValueNotifier<int> _generationNotifier = ValueNotifier<int>(0);
 
   /// Bumped every time a patch is activated or deactivated.
   ///
-  /// Generated services cache their slot lookups and compare against this to
-  /// know when the cache is stale, which turns a per-call map lookup into a
-  /// per-call integer compare.
-  static int get generation => _generation.value;
+  /// Every generated shim reads this on every call and compares it against a
+  /// cached slot, which turns a per-call string hash and map probe into a
+  /// per-call integer compare. Measured at 8.9ns against 4.5ns for a marked
+  /// function that is not itself patched while some other patch is live — the
+  /// normal state of an app once anything has shipped. See `bench/`.
+  ///
+  /// A plain static field rather than the notifier's value, deliberately.
+  /// `ValueNotifier` is subclassed throughout Flutter, so reading `.value` is
+  /// an interface call the compiler cannot always devirtualise, and this is the
+  /// single hottest read in the library.
+  @pragma('vm:prefer-inline')
+  static int get generation => _generation;
 
   /// [generation] as something widgets can listen to.
   ///
   /// v1 has no widget patching, so nothing in the framework listens yet. It is
   /// exposed now because v2's patchable widget zones will need exactly this and
   /// changing the dispatcher later would be a breaking change.
-  static Listenable get generationListenable => _generation;
+  static Listenable get generationListenable => _generationNotifier;
+
+  /// Advances the generation, invalidating every shim's cached slot.
+  ///
+  /// The counter moves first: a listener that calls a patched function from its
+  /// callback must not see a stale slot.
+  static void _bump() {
+    _generationNotifier.value = ++_generation;
+  }
 
   /// Whether a patch is currently dispatching.
   static bool get isActive => _slots != null;
@@ -89,7 +106,7 @@ final class Patch {
     _failureThreshold = failureThreshold;
     _failureCount = 0;
     _depth = 0;
-    _generation.value++;
+    _bump();
   }
 
   /// Stops dispatching. Every shim goes back to its original body.
@@ -100,7 +117,7 @@ final class Patch {
     _onFailure = null;
     _failureCount = 0;
     _depth = 0;
-    _generation.value++;
+    _bump();
   }
 
   /// Calls a patched function with no arguments.
@@ -228,7 +245,8 @@ final class Patch {
     _onFailure = null;
     _failureCount = 0;
     _depth = 0;
-    _generation.value = 0;
+    _generation = 0;
+    _generationNotifier.value = 0;
   }
 }
 
