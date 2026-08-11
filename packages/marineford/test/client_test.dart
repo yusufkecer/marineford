@@ -458,6 +458,53 @@ void main() {
     });
   });
 
+  group('a signed patch cannot brick the device', () {
+    test('a zip bomb is refused instead of allocated', () async {
+      // The container is capped at 8MB, which bounds the download and nothing
+      // else — gzip reaches about 1000:1 on repetitive input. The signature is
+      // checked first, so building one of these needs the signing key; a stolen
+      // key should buy an attacker a bad patch, not an unrecoverable device.
+      await cdn.publish({7: await cdn.buildBomb()});
+
+      final client = makeClient();
+      await client.start();
+      await client.checkForUpdate();
+
+      expect(client.activePatch, 0);
+      expect(observer.ofType<PatchBlocklisted>().single.reason,
+          contains('ceiling'));
+      expect(total(20, 22), 42, reason: 'the store build keeps running');
+    });
+
+    test('the boot attempt is recorded before the patch is opened', () async {
+      // Decompression is the one step that can take the process down rather
+      // than throw, and an OOM does not run a catch block. With the token
+      // written afterwards the attempt was never recorded, so the next launch
+      // loaded the same patch and died the same way — a permanent brick that
+      // the crash-loop guard never saw, because the counter it reads was only
+      // incremented past the thing that killed it.
+      //
+      // Checked from the far side: after a launch that activates a stored
+      // patch, the token must already be on disk, so a kill at any point after
+      // that leaves evidence.
+      await cdn.publish({7: await cdn.buildPatch(_patchSource)});
+      final first = makeClient();
+      await first.start();
+      await first.checkForUpdate();
+      await first.markBootSuccessful();
+      Patch.resetForTesting();
+
+      final second = makeClient();
+      await second.start();
+
+      final file = File('${root.path}${Platform.pathSeparator}state.json');
+      final json = jsonDecode(file.readAsStringSync()) as Map<String, Object?>;
+      expect(json['booting'], 7,
+          reason: 'the token has to survive on disk, not just in memory');
+      expect(json['bootAttempts'], 1);
+    });
+  });
+
   group('network problems never break the app', () {
     test('a 500 on the manifest leaves everything alone', () async {
       cdn.manifestStatusOverride = 500;

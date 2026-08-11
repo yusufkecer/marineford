@@ -83,6 +83,25 @@ class RuntimeOverride {
     return Uint8List.fromList(<int>[...region, ...signature]);
   }
 
+  /// Builds a properly signed container whose payload is a zip bomb.
+  ///
+  /// Signed, because that is the point: the signature is checked before the
+  /// payload is decompressed, so producing one of these needs the signing key.
+  /// The question is what a device does when someone has it.
+  Future<Uint8List> buildBomb({int inflatedBytes = 256 * 1024 * 1024}) async {
+    // Zeros, which is what gets gzip near its 1000:1 ceiling. A few hundred
+    // kilobytes on the wire asks the device for hundreds of megabytes.
+    final payload = Uint8List.fromList(gzip.encode(Uint8List(inflatedBytes)));
+    final region = MfpContainer.buildSignedRegion(
+      payload: payload,
+      abi: abi,
+      flags: MfpFlags.gzip,
+      schema: 1,
+    );
+    final signature = await signer.sign(region);
+    return Uint8List.fromList(<int>[...region, ...signature]);
+  }
+
   /// Publishes [patches] and the manifest that describes them.
   ///
   /// The sequence advances on every call, the way the real publisher does.

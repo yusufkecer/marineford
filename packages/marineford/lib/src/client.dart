@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -159,12 +160,24 @@ final class MarinefordClient {
       await _blocklist(state, number, 'patch file is missing from disk');
       return;
     }
+    // Before opening it, not after. Decompression is the one step here that can
+    // take the process down rather than throw — a signed payload that inflates
+    // to more than the device can hold is killed by the OS, and an OOM does not
+    // run a catch block. With the token written afterwards the attempt was
+    // never recorded, so the next launch loaded the same patch and died the
+    // same way: a permanent brick that the crash-loop guard never saw, because
+    // the counter it reads was only ever incremented on the far side of the
+    // thing that killed it.
+    //
+    // Ordering it this way costs one wasted token when a patch fails
+    // verification, which _blocklist clears on its way out.
+    await _writeBootToken(number);
+
     // Re-verify on every load rather than trusting that it was verified when it
     // was written. The file has been sitting on a device we do not control.
     final program = await _openVerified(bytes, number);
     if (program == null) return;
 
-    await _writeBootToken(number);
     _activateProgram(program, number);
   }
 
@@ -200,12 +213,41 @@ final class MarinefordClient {
 
     try {
       return container.flags.has(MfpFlags.gzip)
-          ? Uint8List.fromList(gzip.decode(container.payload))
+          ? _inflate(container.payload)
           : container.payload;
     } on Object catch (e) {
       await _blocklist(state, number, 'payload could not be decompressed: $e');
       return null;
     }
+  }
+
+  /// Ceiling on what a patch may inflate to.
+  ///
+  /// The container is capped at 8MB, which bounds the download and bounds
+  /// nothing else: gzip reaches ratios around 1000:1 on repetitive input, so
+  /// eight compressed megabytes can ask for gigabytes. The signature is checked
+  /// first, so producing one needs the signing key — but a stolen key should buy
+  /// an attacker a bad patch, not a device that cannot be recovered without a
+  /// store release.
+  ///
+  /// Sixty-four megabytes is far above any real patch. The largest thing
+  /// measured in `bench/` is under 10KB of bytecode, and a patch is a handful of
+  /// functions by design.
+  static const int _maxInflatedBytes = 64 * 1024 * 1024;
+
+  /// Decompresses with a ceiling, refusing rather than allocating past it.
+  ///
+  /// `gzip.decode` takes no limit, so this drives the decoder in chunks and
+  /// gives up the moment the output crosses [_maxInflatedBytes]. Checking as
+  /// the chunks arrive is the entire point — a total measured after the fact is
+  /// measured on memory already taken, which is too late to refuse it.
+  static Uint8List _inflate(Uint8List payload) {
+    final sink = _BoundedSink(_maxInflatedBytes);
+    final converter = gzip.decoder.startChunkedConversion(sink);
+    converter
+      ..add(payload)
+      ..close();
+    return sink.takeBytes();
   }
 
   void _activateProgram(Uint8List bytecode, int number) {
@@ -515,4 +557,40 @@ abstract final class Marineford {
     final support = await getApplicationSupportDirectory();
     return Directory(p.join(support.path, 'marineford', channel));
   }
+}
+
+/// Collects decompressed output, refusing to grow past a limit.
+///
+/// The decoder emits its result in pieces, so the running total can be checked
+/// while it is still cheap to stop. A sink that accumulated first and checked
+/// afterwards would have already done the damage.
+final class _BoundedSink extends ByteConversionSink {
+  _BoundedSink(this.limit);
+
+  /// Most bytes this will accept before throwing.
+  final int limit;
+
+  final BytesBuilder _builder = BytesBuilder(copy: false);
+
+  @override
+  void add(List<int> chunk) {
+    if (_builder.length + chunk.length > limit) {
+      throw FormatException('the patch inflates past the $limit byte ceiling; '
+          'refusing to allocate it');
+    }
+    _builder.add(chunk);
+  }
+
+  @override
+  void addSlice(List<int> chunk, int start, int end, bool isLast) {
+    add(Uint8List.sublistView(
+        chunk is Uint8List ? chunk : Uint8List.fromList(chunk), start, end));
+    if (isLast) close();
+  }
+
+  @override
+  void close() {}
+
+  /// The bytes collected so far.
+  Uint8List takeBytes() => _builder.takeBytes();
 }
