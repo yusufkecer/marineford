@@ -49,9 +49,15 @@ final class AbiBuilder {
   /// Sorted, so the order files happen to be processed in cannot change the
   /// result — a fingerprint that depends on build order would invalidate every
   /// patch at random.
+  ///
+  /// [contractVersion] leads it. It used to be a field that nothing read: the
+  /// documentation said it was part of the hash and the hash did not include
+  /// it, so changing the calling convention left every fingerprint untouched
+  /// and a patch built against the old convention still matched. That is the
+  /// exact failure the version was added to prevent.
   String get canonicalForm {
     final sorted = [..._entries]..sort();
-    return sorted.join('\n');
+    return <String>['contract:$contractVersion', ...sorted].join('\n');
   }
 
   /// The fingerprint, as `sha256:<64 lowercase hex digits>`.

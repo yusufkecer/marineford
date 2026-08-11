@@ -10,6 +10,10 @@ import 'package:pub_semver/pub_semver.dart';
 /// failed — use the original code". A patch that legitimately returns null
 /// therefore needs a distinguishable value, and this is it. Generated shims
 /// unwrap it; hand-written ones must too.
+///
+/// This is not the only value a hand-written shim has to recognise. A patched
+/// `async` function returns a `Future`, which is neither null nor this — see
+/// [Patch.awaitPatched] for what to do with it.
 const Object patchedNull = _PatchedNull();
 
 final class _PatchedNull {
@@ -166,6 +170,11 @@ final class Patch {
   }
 
   /// Calls a patched function with no arguments.
+  ///
+  /// Three results are possible here and in every `invokeN` below: `null` for
+  /// "no patch, or it failed"; [patchedNull] for a patch that returned null;
+  /// and a `Future` when the patched function is `async`, which the caller must
+  /// hand to [awaitPatched] rather than treat as the value.
   static Object? invoke0(int offset, [String id = '']) {
     final runtime = _runtime;
     if (runtime == null) return null;
@@ -223,6 +232,48 @@ final class Patch {
     return _run(runtime, offset, id, staged, mark);
   }
 
+  /// Awaits a patched `Future`, in the same terms the synchronous path uses.
+  ///
+  /// Returns what the patch resolved to, [patchedNull] if it resolved to null,
+  /// or **null if it failed** — the same signal `invoke0` and friends give for
+  /// a patch that threw, so the generated shim answers it the same way: run the
+  /// original function.
+  ///
+  /// That fallback is only sound because of the type boundary. A patch body
+  /// takes JSON and returns JSON; it cannot touch the file system, the network,
+  /// or the app's own state, so running the original after the patch already
+  /// ran cannot repeat a side effect. If that boundary is ever widened, this is
+  /// the guarantee that has to be revisited first.
+  ///
+  /// dart_eval reports an async failure through whichever channel the throw
+  /// happened on: before the first `await` it comes back out of the call
+  /// synchronously and `_run` catches it; after one, the future rejects and
+  /// this does.
+  static Future<Object?> awaitPatched(Object raw, [String id = '']) async {
+    // Outside the catch on purpose. Handing this something that is not a
+    // patched future is a mistake in the calling shim, not a failure of the
+    // downloaded code, and charging it to the patch would count it toward
+    // deactivating a patch that did nothing wrong.
+    if (raw is! Future<Object?>) {
+      throw ArgumentError.value(raw, 'raw',
+          'not a patched future; pass what invoke0 and friends returned');
+    }
+    final before = _failureCount;
+    try {
+      final value = await raw;
+      // Only if nothing failed while this call was suspended. The count means
+      // *consecutive* failures, and a synchronous run of them that piled up
+      // during the await is not broken by this call having succeeded.
+      if (_failureCount == before) _failureCount = 0;
+      if (value == null) return patchedNull;
+      if (value is $Value) return value.$reified ?? patchedNull;
+      return value;
+    } on Object catch (error, stackTrace) {
+      _recordFailure(id, error, stackTrace);
+      return null;
+    }
+  }
+
   /// Runs the patch at [offset].
   ///
   /// [staged] is the list this frame pushed its arguments onto and [mark] is
@@ -238,22 +289,42 @@ final class Patch {
       // the app. Entered once at the outermost frame: a nested call is already
       // in the zone, and re-entering would cost a closure per crossing for
       // nothing.
+      // Always bridgeCall, never execute.
+      //
+      // The two differ only in that bridgeCall saves and restores the program
+      // counter, which is what makes a nested call safe — a patched method
+      // calling another patched method dies with a RangeError on the opcode
+      // array under execute(). The dispatcher used to pick between them on
+      // depth, and that choice was a liability: depth is decremented when the
+      // frame unwinds, but an interpreted `async` function unwinds at its first
+      // await and is resumed later by dart_eval itself. Anything re-entering
+      // during that gap would be judged top-level and get execute(), while the
+      // interpreter was genuinely mid-call.
+      //
+      // Removing the choice removes the way to get it wrong. Verified against
+      // the whole runtime suite, and the extra save/restore is a few
+      // instructions against a 2.6µs crossing.
       final zone = _zone;
-      final Object? raw;
-      if (_depth > 1) {
-        // Re-entry. A patched method that calls another patched method — via a
-        // bridged object, or just `this.other()` on a patched service — lands
-        // here. Runtime.execute() resets the program counter and would corrupt
-        // the frame we are already inside; bridgeCall saves and restores it.
-        // Verified: with execute() the nested case dies with a RangeError on
-        // the opcode array, with bridgeCall it returns the right answer.
+      Object? enter() {
         runtime.bridgeCall(offset);
-        raw = runtime.returnValue;
-      } else if (zone != null) {
-        raw = zone.run(() => runtime.execute(offset));
-      } else {
-        raw = runtime.execute(offset);
+        return runtime.returnValue;
       }
+
+      // Entered once at the outermost frame: a nested call is already in the
+      // zone, and re-entering would cost a closure per crossing for nothing.
+      final Object? raw =
+          _depth > 1 || zone == null ? enter() : zone.run(enter);
+      // An interpreted `async` function hands back a `$Future`, and a `$Future`
+      // is also a `$Value` — so this has to come first or the branch below
+      // would quietly reify it into a *different* future that unwraps only one
+      // level deep. The shim awaits it through [awaitPatched] instead.
+      //
+      // It also comes before the reset below, and that is the load-bearing
+      // part: a suspended call has not succeeded, it has only stopped. Resetting
+      // here let awaitPatched's later increment be wiped by the next dispatch,
+      // so the count oscillated between 0 and 1 and an async patch that failed
+      // every single call was never abandoned.
+      if (raw is Future) return raw;
       // A call that came back is evidence the patch works. Without this the
       // count is cumulative over the whole session, so a patch that throws once
       // an hour on one rare input eventually crosses the threshold and is

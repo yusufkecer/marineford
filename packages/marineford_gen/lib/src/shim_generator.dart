@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import 'package:analyzer/dart/constant/value.dart';
 import 'package:analyzer/dart/element/element.dart';
+import 'package:analyzer/dart/element/nullability_suffix.dart';
 import 'package:analyzer/dart/element/type.dart';
 import 'package:build/build.dart';
 import 'package:marineford_annotation/marineford_annotation.dart';
@@ -24,7 +25,7 @@ const String abiMarker = 'MARINEFORD-ABI: ';
 /// changes, patches built against the old one are not safe to load even though
 /// every user-visible signature is identical. Bump this whenever the emitted
 /// call sequence changes.
-const int kShimContractVersion = 2;
+const int kShimContractVersion = 3;
 
 /// Local variable names the generated shims use.
 ///
@@ -33,6 +34,8 @@ const int kShimContractVersion = 2;
 /// compile or, worse, compiles against the wrong variable.
 const String _slotVar = '_mfSlot';
 const String _resultVar = '_mfResult';
+const String _typedVar = '_mfTyped';
+const String _valueVar = '_mfValue';
 
 /// One patchable function, as recorded for the ABI fingerprint and the id
 /// registry.
@@ -380,13 +383,15 @@ ${overrides.toString().trimRight()}
     lines.writeln('    if ($_slotVar != null) {');
     lines.writeln(
         '      final $_resultVar = ${signature.invocation(_slotVar, id)};');
-    if (signature.returnsVoid) {
+    if (signature.isAsync) {
+      lines.write(_awaitBody(id, signature, fallback));
+    } else if (signature.returnsVoid) {
       lines.writeln('      if ($_resultVar != null) return;');
     } else if (signature.returnIsNullable) {
       lines.writeln(
           '      if (identical($_resultVar, patchedNull)) return null;');
       lines.writeln('      if ($_resultVar != null) {');
-      lines.writeln('        return ${signature.unwrap(_resultVar)};');
+      lines.write(_convert(signature, indent: '        ', source: _resultVar));
       lines.writeln('      }');
     } else {
       // A patch that returns null where the signature says non-null is a bug in
@@ -394,11 +399,69 @@ ${overrides.toString().trimRight()}
       // alternative is a null that the caller's type system says cannot happen.
       lines.writeln('      if ($_resultVar != null && '
           '!identical($_resultVar, patchedNull)) {');
-      lines.writeln('        return ${signature.unwrap(_resultVar)};');
+      lines.write(_convert(signature, indent: '        ', source: _resultVar));
       lines.writeln('      }');
     }
     lines.writeln('    }');
     lines.write('    return $fallback;');
+    return lines.toString();
+  }
+
+  /// Turns the dispatch result into the declared return type, or falls through.
+  ///
+  /// The conversion is total: null means the patch returned something this
+  /// signature cannot accept, and falling through from here runs the original.
+  /// Casting instead would hand a `TypeError` to a caller who has no idea a
+  /// patch is involved — which is the one failure dispatch promises downloaded
+  /// code can never cause.
+  String _convert(_Signature signature,
+      {required String indent, required String source, String? fallback}) {
+    final expression = signature.unwrap(source);
+    if (!signature.conversionCanFail) {
+      return '${indent}return $expression;\n';
+    }
+    final buffer = StringBuffer()
+      ..write('${indent}final $_typedVar = $expression;\n')
+      ..write('${indent}if ($_typedVar != null) return $_typedVar;\n');
+    // The synchronous path falls off the end into the shim's shared fallback;
+    // a continuation has no end to fall off, so it needs one written here.
+    if (fallback != null) buffer.write('${indent}return $fallback;\n');
+    return buffer.toString();
+  }
+
+  /// The async half of [_body]: the interpreter's future, converted.
+  ///
+  /// "A patch that fails runs the original" has to survive the await, so the
+  /// fallback is called from inside the continuation rather than reached by
+  /// falling through. `Patch.awaitPatched` answers null for a patch that threw,
+  /// which is the same signal the synchronous dispatcher already uses — so the
+  /// three branches below are the synchronous ones, one await later.
+  String _awaitBody(String id, _Signature signature, String fallback) {
+    const inner = '          ';
+    final lines = StringBuffer()
+      ..writeln('      if ($_resultVar != null && '
+          '!identical($_resultVar, patchedNull)) {')
+      ..writeln("        return Patch.awaitPatched($_resultVar, r'$id')")
+      ..writeln('            .then(($_valueVar) {')
+      ..writeln('${inner}if ($_valueVar == null) return $fallback;');
+    if (signature.returnsVoid) {
+      lines.writeln('${inner}return null;');
+    } else if (signature.returnIsNullable) {
+      lines
+        ..writeln('${inner}if (identical($_valueVar, patchedNull)) '
+            'return null;')
+        ..write(_convert(signature,
+            indent: inner, source: _valueVar, fallback: fallback));
+    } else {
+      lines
+        ..writeln('${inner}if (identical($_valueVar, patchedNull)) '
+            'return $fallback;')
+        ..write(_convert(signature,
+            indent: inner, source: _valueVar, fallback: fallback));
+    }
+    lines
+      ..writeln('        });')
+      ..writeln('      }');
     return lines.toString();
   }
 
@@ -423,6 +486,7 @@ final class _Signature {
     required this.returnIsNullable,
     required List<String> arguments,
     required this.returnType,
+    required this.isAsync,
   }) : _arguments = arguments;
 
   static _Signature of(
@@ -453,7 +517,7 @@ final class _Signature {
           element: element,
         );
       }
-      final verdict = classifyType(parameter.type);
+      final verdict = classifyType(parameter.type, isReturn: false);
       if (!verdict.isSupported) {
         throw InvalidGenerationSourceError(
           'Parameter `$name` of `$id`: ${verdict.reason}',
@@ -466,9 +530,17 @@ final class _Signature {
       arguments.add(argumentExpression(name, verdict));
     }
 
-    final returnsVoid = returnType is VoidType;
-    if (!returnsVoid) {
-      final verdict = classifyType(returnType);
+    // What the patch result is converted into. For `Future<T>` that is T: the
+    // shim keeps declaring `Future<T>` while everything after the await deals
+    // in T, and the two are never the same type.
+    final awaited = awaitedType(returnType);
+    final resultType = awaited ?? returnType;
+    final returnsVoid = resultType is VoidType;
+
+    // `void` skips the conversion check because there is nothing to convert,
+    // but a `Future<void>` still has the Future itself to validate.
+    if (!returnsVoid || awaited != null) {
+      final verdict = classifyType(returnType, isReturn: true);
       if (!verdict.isSupported) {
         throw InvalidGenerationSourceError(
           'Return type of `$id`: ${verdict.reason}',
@@ -485,9 +557,10 @@ final class _Signature {
       returnDisplay: returnType.getDisplayString(),
       returnsVoid: returnsVoid,
       returnIsNullable:
-          returnType.nullabilitySuffix.toString().contains('question'),
+          resultType.nullabilitySuffix == NullabilitySuffix.question,
       arguments: arguments,
-      returnType: returnType,
+      returnType: resultType,
+      isAsync: awaited != null,
     );
   }
 
@@ -498,7 +571,16 @@ final class _Signature {
   final String returnDisplay;
   final bool returnsVoid;
   final bool returnIsNullable;
+
+  /// The type the patch result is converted into.
+  ///
+  /// For a `Future<T>` shim this is T, not the declared type — see
+  /// [returnDisplay] for what the emitted signature says.
   final DartType returnType;
+
+  /// Whether the declared return type is a `Future`.
+  final bool isAsync;
+
   final List<String> _arguments;
 
   /// The `Patch.invokeN(...)` call for this arity.
@@ -512,4 +594,7 @@ final class _Signature {
 
   /// Converts the dispatch result back to the declared return type.
   String unwrap(String expression) => returnExpression(expression, returnType);
+
+  /// Whether [unwrap]'s expression can answer null and so needs a check.
+  bool get conversionCanFail => returnCanFail(returnType);
 }

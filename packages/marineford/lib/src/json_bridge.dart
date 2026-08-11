@@ -83,27 +83,47 @@ abstract final class MarinefordJson {
   /// The `$Value` branch still catches everything else, including a bridged
   /// object nested inside.
   static Object? unwrap(Object? value) {
-    if (value is $Map) {
-      return <Object?, Object?>{
-        for (final entry in value.$value.entries)
-          unwrap(entry.key): unwrap(entry.value),
-      };
-    }
-    if (value is $List) {
-      return <Object?>[for (final item in value.$value) unwrap(item)];
-    }
+    if (value is $Map) return _plainMap(value.$value);
+    if (value is $List) return _plainList(value.$value);
     if (value is $Value) return unwrap(value.$reified);
-    if (value is Map) {
-      return <Object?, Object?>{
-        for (final entry in value.entries)
-          unwrap(entry.key): unwrap(entry.value),
-      };
-    }
-    if (value is List) {
-      return <Object?>[for (final item in value) unwrap(item)];
-    }
+    if (value is Map) return _plainMap(value);
+    if (value is List) return _plainList(value);
     return value;
   }
+
+  /// A decoded map, typed as precisely as its keys allow.
+  ///
+  /// `Map<String, dynamic>` whenever every key is a string, which is every JSON
+  /// object. The precision is load-bearing rather than cosmetic: a shim
+  /// converting to `List<Map<String, dynamic>>` tests each element with `is`,
+  /// and `Map<Object?, Object?>` fails that test however string-keyed it
+  /// happens to be — so a patch returning a list of JSON objects, the most
+  /// ordinary response shape there is, was discarded as if it had returned
+  /// garbage.
+  static Object _plainMap(Map<Object?, Object?> source) {
+    final typed = <String, dynamic>{};
+    Map<Object?, Object?>? untyped;
+    for (final entry in source.entries) {
+      final key = unwrap(entry.key);
+      final item = unwrap(entry.value);
+      if (untyped != null) {
+        untyped[key] = item;
+      } else if (key is String) {
+        typed[key] = item;
+      } else {
+        // One non-string key and the precise form is unavailable; carry over
+        // what has been built rather than walking the entries twice.
+        untyped = <Object?, Object?>{...typed, key: item};
+      }
+    }
+    return untyped ?? typed;
+  }
+
+  /// A decoded list. `List<dynamic>` is as precise as this can be: the elements
+  /// are only known one at a time, and the shim's own conversion is what
+  /// applies the declared element type.
+  static List<dynamic> _plainList(List<Object?> source) =>
+      <dynamic>[for (final item in source) unwrap(item)];
 
   /// The shape JSON callers actually want, built in one pass.
   ///
@@ -121,9 +141,10 @@ abstract final class MarinefordJson {
   static Map<String, dynamic>? unwrapMap(Object? value) {
     final source = _mapView(value);
     if (source == null) return null;
+    final (entries, needsUnwrap) = source;
     return <String, dynamic>{
-      for (final entry in source.entries)
-        _stringKey(entry.key): unwrap(entry.value),
+      for (final entry in entries.entries)
+        _stringKey(entry.key): needsUnwrap ? unwrap(entry.value) : entry.value,
     };
   }
 
@@ -133,30 +154,115 @@ abstract final class MarinefordJson {
   static List<dynamic>? unwrapList(Object? value) {
     final source = _listView(value);
     if (source == null) return null;
-    return <dynamic>[for (final item in source) unwrap(item)];
+    final (items, needsUnwrap) = source;
+    return <dynamic>[
+      for (final item in items) needsUnwrap ? unwrap(item) : item,
+    ];
+  }
+
+  /// [value] as a `Map<K, V>`, or null if the patch did not produce one.
+  ///
+  /// Null rather than a thrown cast, and that is the whole point. A patch that
+  /// returns the wrong shape is a patch bug, and the shim's answer to a patch
+  /// bug is to run the original function. A cast here would instead reach the
+  /// caller as a `TypeError` — the one outcome dispatch promises never to
+  /// produce from downloaded code.
+  ///
+  /// String keys keep the leniency [unwrapMap] has always had: a patch that
+  /// used a number as a key still gets a usable map. Any other mismatch is a
+  /// mismatch.
+  static Map<K, V>? mapOf<K, V>(Object? value) {
+    final source = _mapView(value);
+    if (source == null) return null;
+    final (entries, needsUnwrap) = source;
+    final out = <K, V>{};
+    for (final entry in entries.entries) {
+      final key = needsUnwrap ? unwrap(entry.key) : entry.key;
+      final item = needsUnwrap ? unwrap(entry.value) : entry.value;
+      if (item is! V) return null;
+      if (key is K) {
+        out[key] = item;
+      } else if (K == String) {
+        out['$key' as K] = item;
+      } else {
+        return null;
+      }
+    }
+    return out;
+  }
+
+  /// [value] as a `List<E>`, or null if the patch did not produce one.
+  ///
+  /// See [mapOf] for why this returns null instead of casting.
+  static List<E>? listOf<E>(Object? value) {
+    final source = _listView(value);
+    if (source == null) return null;
+    final (items, needsUnwrap) = source;
+    final out = <E>[];
+    for (final item in items) {
+      final element = needsUnwrap ? unwrap(item) : item;
+      if (element is! E) return null;
+      out.add(element);
+    }
+    return out;
+  }
+
+  /// [value] as a `Set<E>`, or null if the patch did not produce one.
+  ///
+  /// Interpreted collections arrive as lists, so a declared `Set` return needs
+  /// building rather than casting — a list is never a set, whatever its
+  /// element type. Built in one pass: routing through [listOf] would allocate
+  /// the collection twice on a path that is already the expensive half of a
+  /// dispatched call.
+  static Set<E>? setOf<E>(Object? value) {
+    final source = _listView(value);
+    if (source == null) return null;
+    final (items, needsUnwrap) = source;
+    final out = <E>{};
+    for (final item in items) {
+      final element = needsUnwrap ? unwrap(item) : item;
+      if (element is! E) return null;
+      out.add(element);
+    }
+    return out;
+  }
+
+  /// [value] as a `T`, or null if the patch produced something else.
+  ///
+  /// The scalar counterpart of [mapOf]. It still goes through [unwrap], because
+  /// what arrives may be an interpreter value rather than a reified one; for a
+  /// scalar that is a passthrough.
+  static T? valueOf<T>(Object? value) {
+    final plain = unwrap(value);
+    return plain is T ? plain : null;
   }
 
   /// The map inside [value] without copying it, or null if there is not one.
   ///
   /// The point is to reach the entries without materialising an intermediate
-  /// map that is thrown away one line later.
-  static Map<Object?, Object?>? _mapView(Object? value) {
-    if (value is $Map) return value.$value;
-    if (value is Map) return value;
+  /// map that is thrown away one line later. The flag says whether the entries
+  /// still hold interpreter values: the fallback branch has already unwrapped
+  /// them, and unwrapping a second time would rebuild every nested container
+  /// underneath for nothing.
+  static (Map<Object?, Object?>, bool)? _mapView(Object? value) {
+    if (value is $Map) return (value.$value, true);
+    if (value is Map) return (value, true);
     // Anything else that might still be a map — a bridged type, a $Value that
     // is not $Map — cannot be inspected without converting it first. That path
     // pays the copy the fast one avoids, which is the right trade: it is rare,
     // and the alternative is special-casing every $Value subtype dart_eval has.
     final plain = unwrap(value);
-    return plain is Map ? plain : null;
+    return plain is Map ? (plain, false) : null;
   }
 
   /// The list inside [value] without copying it, or null if there is not one.
-  static List<Object?>? _listView(Object? value) {
-    if (value is $List) return value.$value;
-    if (value is List) return value;
+  ///
+  /// See [_mapView] for what the flag means.
+  static (List<Object?>, bool)? _listView(Object? value) {
+    if (value is $List) return (value.$value, true);
+    if (value is List) return (value, true);
     final plain = unwrap(value);
-    return plain is List ? plain : null;
+    return plain is List ? (plain, false) : null;
   }
 
   /// A JSON object key as a string.

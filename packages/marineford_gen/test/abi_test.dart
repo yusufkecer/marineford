@@ -103,13 +103,42 @@ void main() {
     });
   });
 
+  group('the calling contract', () {
+    // The version was a field nothing read: documented as part of the hash,
+    // absent from it. Changing how shims call the interpreter therefore left
+    // every fingerprint untouched, and a patch built against the old calling
+    // convention went on matching — the exact failure the version exists to
+    // prevent.
+    AbiBuilder sameSurface(int contract) {
+      final abi = AbiBuilder(contractVersion: contract);
+      abi.add(id: 'pkg:app/lib/a.dart#one', parameterTypes: ['int'],
+          returnType: 'int');
+      return abi;
+    }
+
+    test('a different contract is a different fingerprint', () {
+      expect(sameSurface(2).build(), isNot(sameSurface(3).build()));
+    });
+
+    test('the same contract is the same fingerprint', () {
+      expect(sameSurface(3).build(), sameSurface(3).build());
+    });
+
+    test('it is visible in the canonical form', () {
+      expect(sameSurface(3).canonicalForm, startsWith('contract:3\n'));
+    });
+  });
+
   test('the canonical form is readable, for debugging a mismatch', () {
     final abi = builderWith([
       ('pkg:app/lib/b.dart#two', ['String'], 'bool'),
       ('pkg:app/lib/a.dart#one', ['int'], 'int'),
     ]);
-    expect(abi.canonicalForm,
-        'pkg:app/lib/a.dart#one(int)->int\npkg:app/lib/b.dart#two(String)->bool');
+    expect(
+        abi.canonicalForm,
+        'contract:1\n'
+        'pkg:app/lib/a.dart#one(int)->int\n'
+        'pkg:app/lib/b.dart#two(String)->bool');
     expect(abi.length, 2);
   });
 }

@@ -58,6 +58,7 @@ final class Patch {
           [String id = '']) =>
       null;
   static Object? invokeN(int o, List<Object?> a, [String id = '']) => null;
+  static Future<Object?> awaitPatched(Object r, [String id = '']) async => null;
 }
 const Object patchedNull = Object();
 abstract final class MarinefordJson {
@@ -65,6 +66,10 @@ abstract final class MarinefordJson {
   static Object? unwrap(Object? v) => v;
   static Map<String, dynamic>? unwrapMap(Object? v) => null;
   static List<dynamic>? unwrapList(Object? v) => null;
+  static Map<K, V>? mapOf<K, V>(Object? v) => null;
+  static List<E>? listOf<E>(Object? v) => null;
+  static Set<E>? setOf<E>(Object? v) => null;
+  static T? valueOf<T>(Object? v) => null;
 }
 ''';
 
@@ -120,6 +125,7 @@ Future<String> generateError(String source) async {
 }
 
 const _imports = '''
+import 'dart:async';
 import 'package:marineford/marineford.dart';
 import 'package:marineford_annotation/marineford_annotation.dart';
 part 'pricing.marineford.dart';
@@ -178,7 +184,48 @@ $_imports
 @patchable
 Map<String, dynamic> _normalize(Map<String, dynamic> raw) => raw;
 ''');
-      expect(output, contains('MarinefordJson.unwrapMap(_mfResult)'));
+      expect(
+          output, contains('MarinefordJson.mapOf<String, dynamic>(_mfResult)'));
+    });
+
+    test('a conversion that fails falls through to the original', () async {
+      // The conversion is total on purpose. A patch that returns the wrong
+      // shape must reach the original function, not the caller as a TypeError.
+      final output = await generate('''
+$_imports
+@patchable
+Map<String, dynamic> _normalize(Map<String, dynamic> raw) => raw;
+''');
+      expect(
+        collapse(output),
+        contains(collapse('''
+          final _mfTyped = MarinefordJson.mapOf<String, dynamic>(_mfResult);
+          if (_mfTyped != null) return _mfTyped;
+        ''')),
+      );
+      expect(collapse(output), contains(collapse('return _normalize(raw);')));
+    });
+
+    test('collection returns keep their type argument', () async {
+      // `unwrapList` builds a List<dynamic>, so the old `as List<String>` threw
+      // on a patch that was working perfectly. Nothing ran a collection return,
+      // so nothing noticed.
+      final output = await generate('''
+$_imports
+@patchable
+List<String> _names(int count) => const <String>[];
+
+@patchable
+Map<String, int> _counts(int seed) => const <String, int>{};
+
+@patchable
+Set<String> _tags(int seed) => const <String>{};
+''');
+      expect(output, contains('MarinefordJson.listOf<String>(_mfResult)'));
+      expect(output, contains('MarinefordJson.mapOf<String, int>(_mfResult)'));
+      expect(output, contains('MarinefordJson.setOf<String>(_mfResult)'));
+      expect(output, isNot(contains(' as List<String>')));
+      expect(output, isNot(contains(' as Map<String, int>')));
     });
 
     test('handles a nullable return without confusing it with no patch',
@@ -261,9 +308,34 @@ $signature
           'Cart _build(int v) => const Cart();', 'needs a dart_eval binding');
     });
 
-    test('a Future return', () async {
-      await rejects(
-          'Future<int> _load(int v) async => v;', 'cannot cross the patch');
+    test('a Stream return', () async {
+      await rejects('Stream<int> _watch(int v) => throw 0;',
+          '`Stream` cannot cross the patch boundary');
+    });
+
+    test('a FutureOr return', () async {
+      await rejects('FutureOr<int> _maybe(int v) => v;',
+          '`FutureOr` cannot cross the patch boundary');
+    });
+
+    test('a Future parameter', () async {
+      await rejects('int _take(Future<int> v) => 0;',
+          'a `Future` parameter cannot cross the patch boundary');
+    });
+
+    test('a nullable Future return', () async {
+      await rejects('Future<int>? _maybe(int v) => null;',
+          'a nullable `Future` return');
+    });
+
+    test('a nested Future return', () async {
+      await rejects('Future<Future<int>> _nested(int v) => throw 0;',
+          'a nested `Future` return');
+    });
+
+    test('a Future of something unsupported', () async {
+      await rejects('Future<Cart> _load(int v) async => const Cart();',
+          'what the `Future` resolves to');
     });
 
     test('a callback parameter', () async {
@@ -274,6 +346,130 @@ $signature
     test('named parameters', () async {
       await rejects(
           'int _f(int a, {int b = 0}) => a;', 'named parameters are not');
+    });
+  });
+
+  group('async returns', () {
+    test('the future is handed back, converted inside the continuation',
+        () async {
+      final output = await generate('''
+$_imports
+@patchable
+Future<Map<String, dynamic>> _fetch(String url) async => const {};
+''');
+      expect(collapse(output),
+          contains(collapse('Future<Map<String, dynamic>> fetch(String url)')));
+      expect(
+        collapse(output),
+        contains(collapse('''
+          return Patch.awaitPatched(
+            _mfResult,
+            r'pkg:app/lib/pricing.dart#fetch',
+          ).then((_mfValue) {
+            if (_mfValue == null) return _fetch(url);
+        ''')),
+      );
+      expect(
+        collapse(output),
+        contains(collapse('''
+          final _mfTyped = MarinefordJson.mapOf<String, dynamic>(_mfValue);
+          if (_mfTyped != null) return _mfTyped;
+          return _fetch(url);
+        ''')),
+        reason: 'a conversion that fails after the await must still reach the '
+            'original',
+      );
+      expectValidDart(asLibrary(output));
+    });
+
+    test('a failure after the await runs the original', () async {
+      // awaitPatched answers null for a patch that threw, which is the same
+      // signal the synchronous dispatcher gives. The guarantee has to survive
+      // the await or async patches would be the one case that can crash.
+      final output = await generate('''
+$_imports
+@patchable
+Future<int> _score(int base) async => base;
+''');
+      expect(collapse(output),
+          contains(collapse('if (_mfValue == null) return _score(base);')));
+      expect(collapse(output),
+          contains(collapse('MarinefordJson.valueOf<int>(_mfValue)')));
+      expectValidDart(asLibrary(output));
+    });
+
+    test('a nullable result keeps patchedNull meaning null', () async {
+      final output = await generate('''
+$_imports
+@patchable
+Future<Map<String, dynamic>?> _maybe(int v) async => null;
+''');
+      expect(collapse(output),
+          contains(collapse('if (identical(_mfValue, patchedNull)) '
+              'return null;')));
+      expectValidDart(asLibrary(output));
+    });
+
+    test('a non-nullable result treats patchedNull as a patch bug', () async {
+      final output = await generate('''
+$_imports
+@patchable
+Future<int> _score(int base) async => base;
+''');
+      expect(collapse(output),
+          contains(collapse('if (identical(_mfValue, patchedNull)) '
+              'return _score(base);')));
+    });
+
+    test('Future<void> reports that the patch handled it', () async {
+      final output = await generate('''
+$_imports
+@patchable
+Future<void> _audit(String message) async {}
+''');
+      expect(collapse(output),
+          contains(collapse('Future<void> audit(String message)')));
+      expect(collapse(output),
+          contains(collapse('if (_mfValue == null) return _audit(message);')));
+      expect(collapse(output), contains(collapse('return null;')));
+      expectValidDart(asLibrary(output));
+    });
+
+    test('collection element types survive the await', () async {
+      final output = await generate('''
+$_imports
+@patchable
+Future<List<String>> _names(int count) async => const [];
+''');
+      expect(output, contains('MarinefordJson.listOf<String>(_mfValue)'));
+      expectValidDart(asLibrary(output));
+    });
+
+    test('a dynamic result needs no conversion check', () async {
+      final output = await generate('''
+$_imports
+@patchable
+Future<dynamic> _anything(int v) async => v;
+''');
+      expect(collapse(output),
+          contains(collapse('return MarinefordJson.unwrap(_mfValue);')));
+      expect(collapse(output), isNot(contains(collapse('final _mfTyped ='))));
+      expectValidDart(asLibrary(output));
+    });
+
+    test('a service method can be async too', () async {
+      final output = await generate('''
+$_imports
+@PatchableService()
+class RulesBase {
+  Future<int> total(int a, int b) async => a + b;
+}
+''');
+      expect(collapse(output), contains(collapse('_mfSync();')));
+      expect(collapse(output), contains(collapse('Patch.awaitPatched(')));
+      expect(collapse(output),
+          contains(collapse('if (_mfValue == null) return super.total(a, b);')));
+      expectValidDart(asLibrary(output));
     });
   });
 
@@ -381,7 +577,7 @@ class RulesBase {
 ''');
       expectValidDart(asLibrary(output));
       expect(output, contains('void audit(String message) {'));
-      expect(output, contains('MarinefordJson.unwrapList(_mfResult)'));
+      expect(output, contains('MarinefordJson.listOf<String>(_mfResult)'));
     });
   });
 }

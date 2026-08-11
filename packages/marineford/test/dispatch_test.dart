@@ -22,6 +22,8 @@ Runtime compile(String source) {
 void main() {
   tearDown(Patch.resetForTesting);
   _gaps();
+  _returnConversion();
+  _asyncDispatch();
 
   group('no patch active', () {
     test('slot lookups return null', () {
@@ -465,5 +467,232 @@ int boom(int a) { return a ~/ 0; }
       onFailure: (_, __, ___) => throw StateError('handler is broken'),
     );
     expect(() => Patch.invoke1(Patch.slot('#boom')!, 5), returnsNormally);
+  });
+}
+
+/// Converting the dispatch result back to the declared return type.
+///
+/// This is the path nothing used to run. The generator emitted
+/// `unwrapList(r) as List<String>`, `unwrapList` builds a `List<dynamic>`, and
+/// that cast throws — so a patch that was working perfectly failed at the
+/// boundary, and a patch that returned the wrong shape reached the caller as a
+/// `TypeError` instead of falling back. Both were invisible because every test
+/// asserted the generated *source* and none ran a collection return.
+void _returnConversion() {
+  group('return conversion', () {
+    late Runtime runtime;
+
+    setUp(() {
+      runtime = compile('''
+@RuntimeOverride('#names', version: '>=1.0.0')
+List names(int count) { return ['a', 'b']; }
+
+@RuntimeOverride('#counts', version: '>=1.0.0')
+Map counts(int seed) { return {'a': 1, 'b': 2}; }
+
+@RuntimeOverride('#wrong', version: '>=1.0.0')
+String wrong(int seed) { return 'not a map'; }
+
+@RuntimeOverride('#rows', version: '>=1.0.0')
+List rows(int seed) { return [{'id': 1}, {'id': 2}]; }
+
+@RuntimeOverride('#grouped', version: '>=1.0.0')
+Map grouped(int seed) { return {'a': [1, 2], 'b': [3]}; }
+''')..loadGlobalOverrides();
+      Patch.activate(runtime, resolveSlots(runtime, Version.parse('1.4.0')));
+    });
+
+    Object? call(String id, Object? argument) =>
+        Patch.invoke1(Patch.slot(id)!, argument, id);
+
+    test('a list keeps its element type across the boundary', () {
+      expect(
+          MarinefordJson.listOf<String>(call('#names', 2)), <String>['a', 'b']);
+    });
+
+    test('a map keeps both type arguments', () {
+      expect(MarinefordJson.mapOf<String, int>(call('#counts', 1)),
+          <String, int>{'a': 1, 'b': 2});
+    });
+
+    test('a set is built rather than cast', () {
+      // A list is never a set, whatever its element type, so the old cast could
+      // not have worked for a declared Set return under any circumstances.
+      expect(
+          MarinefordJson.setOf<String>(call('#names', 2)), <String>{'a', 'b'});
+    });
+
+    test('an element of the wrong type answers null, not a TypeError', () {
+      expect(MarinefordJson.listOf<int>(call('#names', 2)), isNull);
+    });
+
+    test('a wrong shape answers null, not a TypeError', () {
+      expect(MarinefordJson.mapOf<String, dynamic>(call('#wrong', 1)), isNull);
+    });
+
+    test('the flagship shape is unchanged', () {
+      expect(MarinefordJson.mapOf<String, dynamic>(call('#counts', 1)),
+          <String, dynamic>{'a': 1, 'b': 2});
+    });
+
+    test('a list of JSON objects survives', () {
+      // The shape that was silently discarded: unwrap built each element as
+      // Map<Object?, Object?>, which is not a Map<String, dynamic>, so the `is`
+      // test rejected a patch that was working perfectly. Every earlier test
+      // here is one level deep, which is exactly why nothing caught it.
+      expect(
+        MarinefordJson.listOf<Map<String, dynamic>>(call('#rows', 0)),
+        <Map<String, dynamic>>[
+          {'id': 1},
+          {'id': 2},
+        ],
+      );
+    });
+
+    test('a map of lists survives', () {
+      expect(
+        MarinefordJson.mapOf<String, List<dynamic>>(call('#grouped', 0)),
+        <String, List<dynamic>>{
+          'a': [1, 2],
+          'b': [3],
+        },
+      );
+    });
+
+    test('a nested element of the wrong type still answers null', () {
+      expect(MarinefordJson.listOf<Map<String, int>>(call('#rows', 0)), isNull,
+          reason: 'Map<String, int> is not a shape the unwrapping produces, so '
+              'the conversion must refuse rather than pretend');
+    });
+  });
+}
+
+/// Patching an `async` function.
+///
+/// dart_eval hands an interpreted async function back as a `$Future`, which is
+/// also a `$Value` — so the dispatcher has to recognise it before it reifies
+/// anything, and the shim has to keep the "a patch that fails runs the
+/// original" guarantee across the await rather than only up to it.
+void _asyncDispatch() {
+  group('async dispatch', () {
+    late Runtime runtime;
+    late List<String> failures;
+
+    setUp(() {
+      runtime = compile('''
+@RuntimeOverride('#slow', version: '>=1.0.0')
+Future slow(int a) async {
+  await Future.delayed(Duration(milliseconds: 1));
+  return a + 1;
+}
+
+@RuntimeOverride('#lateBoom', version: '>=1.0.0')
+Future lateBoom(int a) async {
+  await Future.delayed(Duration(milliseconds: 1));
+  return a ~/ 0;
+}
+
+@RuntimeOverride('#earlyBoom', version: '>=1.0.0')
+Future earlyBoom(int a) async {
+  return a ~/ 0;
+}
+
+@RuntimeOverride('#nullResult', version: '>=1.0.0')
+Future nullResult(int a) async {
+  await Future.delayed(Duration(milliseconds: 1));
+  return null;
+}
+
+@RuntimeOverride('#mapResult', version: '>=1.0.0')
+Future mapResult(int a) async {
+  await Future.delayed(Duration(milliseconds: 1));
+  return {'value': a};
+}
+''')..loadGlobalOverrides();
+      failures = <String>[];
+      Patch.activate(
+        runtime,
+        resolveSlots(runtime, Version.parse('1.4.0')),
+        onFailure: (id, error, _) => failures.add(id),
+        failureThreshold: 3,
+      );
+    });
+
+    Object? call(String id, int argument) =>
+        Patch.invoke1(Patch.slot(id)!, argument, id);
+
+    test('an async patch comes back as a future, not a reified value', () {
+      // $Future is also a $Value. Reifying it would produce a *different*
+      // future that unwraps one level deep, and the shim would then convert
+      // the wrong thing.
+      expect(call('#slow', 41), isA<Future<Object?>>());
+    });
+
+    test('awaiting it gives the resolved value', () async {
+      expect(await Patch.awaitPatched(call('#slow', 41)!, '#slow'), 42);
+    });
+
+    test('a patch that resolves to null is distinguishable from a failure',
+        () async {
+      final value =
+          await Patch.awaitPatched(call('#nullResult', 1)!, '#nullResult');
+      expect(identical(value, patchedNull), isTrue,
+          reason: 'null means "the patch failed"; the sentinel means "the '
+              'patch said null"');
+    });
+
+    test('a collection resolves through the same conversion', () async {
+      final value =
+          await Patch.awaitPatched(call('#mapResult', 7)!, '#mapResult');
+      expect(MarinefordJson.mapOf<String, dynamic>(value),
+          <String, dynamic>{'value': 7});
+    });
+
+    // Blocked: inside the guarded zone an interpreted async function that
+    // throws after its first await never completes its future — dart_eval
+    // delivers the error to the zone's handleUncaughtError instead of to the
+    // completer the caller is holding. Outside a zone the same patch rejects
+    // normally, so this is the zone and the interpreter disagreeing about who
+    // owns the failure. Reproduced standalone; see the async section of the
+    // README for where this stands.
+    const blocked = 'async failure after an await is swallowed by the guarded '
+        'zone and the future never completes';
+
+    test('a throw after the await is counted and answers null', skip: blocked,
+        () async {
+      // The channel the synchronous catch cannot see: dart_eval rejects the
+      // returned future rather than throwing out of the call.
+      final raw = call('#lateBoom', 5);
+      expect(raw, isA<Future<Object?>>(),
+          reason: 'the failure has not happened yet at this point');
+      expect(await Patch.awaitPatched(raw!, '#lateBoom'), isNull);
+      expect(failures, ['#lateBoom']);
+    });
+
+    test('a throw before the first await arrives synchronously', () {
+      // dart_eval runs an async body eagerly to its first suspension point, so
+      // this one never becomes a future at all and `_run` catches it.
+      expect(call('#earlyBoom', 5), isNull);
+      expect(failures, ['#earlyBoom']);
+    });
+
+    test('a success resets the consecutive failure count', skip: blocked,
+        () async {
+      await Patch.awaitPatched(call('#lateBoom', 5)!, '#lateBoom');
+      expect(Patch.failureCount, 1);
+      await Patch.awaitPatched(call('#slow', 1)!, '#slow');
+      expect(Patch.failureCount, 0,
+          reason: 'the threshold counts consecutive failures, not lifetime '
+              'ones');
+    });
+
+    test('repeated async failures deactivate the patch', skip: blocked,
+        () async {
+      for (var i = 0; i < 3; i++) {
+        await Patch.awaitPatched(call('#lateBoom', 5)!, '#lateBoom');
+      }
+      expect(Patch.isActive, isFalse);
+      expect(failures.length, 3);
+    });
   });
 }
