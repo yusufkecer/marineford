@@ -343,6 +343,22 @@ map, which disappears next to the crossing, but 34 µs for fifty rows of eight
 fields, which does not. Pass a patch the part of a response it needs rather than
 the whole response.
 
+### Mark in the app package, not in a package it depends on
+
+The generator computes one fingerprint per package, from the marked functions in
+that package. It cannot see into your dependencies — build_runner gives a builder
+no way to enumerate another package's files.
+
+So a `@patchable` function in a shared package of your own is a trap. It still
+generates a shim and still dispatches, because dispatch ids are global. But it is
+absent from the app's fingerprint, which means changing its signature will not
+invalidate patches built against the old one — the single failure the fingerprint
+exists to prevent.
+
+`marineford doctor` catches it from the other side: an override whose id the app
+does not declare is refused before you can publish. Keep marked functions in the
+app package and the question does not arise.
+
 ---
 
 ## What can cross the boundary

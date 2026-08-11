@@ -16,6 +16,21 @@ import 'shim_generator.dart' show abiMarker, kShimContractVersion;
 /// * `marineford_ids.json`, the list of dispatch ids, which `marineford doctor` checks
 ///   a patch package against so a typo in an `@RuntimeOverride` id is caught
 ///   before publishing rather than by silence in the field.
+///
+/// ## One package, not the whole dependency graph
+///
+/// `findAssets` only sees the package the build is running in, so "the whole
+/// app" means the app package. A `@patchable` function in a package the app
+/// depends on gets its own shim and its own registry, and is absent from the
+/// app's fingerprint — while the runtime dispatches by a global id and would
+/// happily run a patch for it. That is a hole in the guarantee the fingerprint
+/// exists to provide: the signature could change and nothing would notice.
+///
+/// build_runner offers no way to enumerate another package's assets, so this
+/// cannot be closed here. It is made loud instead of silent: the registry says
+/// which package it covers, and `marineford doctor` refuses a patch that
+/// overrides an id the app does not declare — which is exactly what an id from
+/// a dependency looks like from the app's side.
 final class AbiAggregator implements Builder {
   /// Creates an [AbiAggregator].
   const AbiAggregator();
@@ -89,15 +104,19 @@ final class AbiAggregator implements Builder {
     }
     final fingerprint = abi.build();
 
+    final package = buildStep.inputId.package;
     if (buildStep.inputId.path.endsWith(r'$lib$')) {
       await buildStep.writeAsString(
-        AssetId(buildStep.inputId.package, 'lib/marineford.g.dart'),
-        _library(fingerprint, records),
+        AssetId(package, 'lib/marineford.g.dart'),
+        _library(fingerprint, records, package),
       );
     } else {
       await buildStep.writeAsString(
-        AssetId(buildStep.inputId.package, 'marineford_ids.json'),
+        AssetId(package, 'marineford_ids.json'),
         const JsonEncoder.withIndent('  ').convert(<String, Object?>{
+          // Named, because the answer to "why is my override unknown?" is
+          // sometimes "you generated this for a different package".
+          'package': package,
           'abi': fingerprint,
           'ids': records,
         }),
@@ -105,7 +124,8 @@ final class AbiAggregator implements Builder {
     }
   }
 
-  String _library(String abi, List<Map<String, Object?>> records) {
+  String _library(
+      String abi, List<Map<String, Object?>> records, String package) {
     final ids = StringBuffer();
     for (final record in records) {
       ids.writeln("  r'${record['id']}',");
@@ -121,7 +141,10 @@ final class AbiAggregator implements Builder {
 /// older build from loading against changed method signatures — the failure
 /// semver alone cannot catch.
 ///
-/// Covers ${records.length} patchable function${records.length == 1 ? '' : 's'}.
+/// Covers ${records.length} patchable function${records.length == 1 ? '' : 's'}
+/// in package `$package`, and nothing outside it. A `@patchable` function in a
+/// package this one depends on is not part of this fingerprint, so a change to
+/// its signature will not invalidate patches. Keep marked functions here.
 const String kMarinefordAbi =
     '$abi';
 
