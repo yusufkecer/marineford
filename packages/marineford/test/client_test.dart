@@ -19,6 +19,61 @@ const _otherPatchSource = '''
 int total(int a, int b) { return (a + b) * 3; }
 ''';
 
+/// Asserts every field of the client's persisted state, in memory and on disk.
+///
+/// Every blocker this suite let through was let through the same way: the test
+/// checked what the call returned and stopped there. `selectPatch` was deciding
+/// correctly, the assertion passed, and nobody asked what the next launch would
+/// read. The sequence high-water mark was being written on a manifest the
+/// client had just refused, and no test could have noticed, because no test
+/// looked at it.
+///
+/// Two things make this close the gap by construction rather than by anyone
+/// remembering. Every field is required, so a new field cannot be quietly
+/// omitted from an existing assertion the way `lastSequence` was. And the check
+/// runs against the file, not only the object: what the client believes is
+/// worth nothing if the next launch reads something else, and a divergence
+/// between the two is itself the bug in every crash-loop and replay defect
+/// found here.
+void expectState(
+  MarinefordClient client,
+  Directory root, {
+  required int installed,
+  required Set<int> blocklist,
+  required int? booting,
+  required int bootAttempts,
+  required String? manifestEtag,
+  required int lastSequence,
+}) {
+  final memory = client.state;
+  expect(memory.installed, installed, reason: 'installed, in memory');
+  expect(memory.blocklist, blocklist, reason: 'blocklist, in memory');
+  expect(memory.booting, booting, reason: 'booting, in memory');
+  expect(memory.bootAttempts, bootAttempts, reason: 'bootAttempts, in memory');
+  expect(memory.manifestEtag, manifestEtag, reason: 'manifestEtag, in memory');
+  expect(memory.lastSequence, lastSequence, reason: 'lastSequence, in memory');
+
+  final file = File('${root.path}${Platform.pathSeparator}state.json');
+  expect(file.existsSync(), isTrue,
+      reason: 'state.json must exist; nothing survives a restart without it');
+
+  // Read as raw JSON rather than through PatchState.fromJson, which is
+  // deliberately forgiving of a corrupt file. Its tolerance would hide a write
+  // that produced the wrong shape, and the written shape is the thing under
+  // test.
+  final json = jsonDecode(file.readAsStringSync()) as Map<String, Object?>;
+  expect(json['installed'], installed, reason: 'installed, on disk');
+  expect((json['blocklist']! as List).map((Object? n) => n! as int).toSet(),
+      blocklist,
+      reason: 'blocklist, on disk');
+  expect(json['booting'], booting, reason: 'booting, on disk');
+  expect(json['bootAttempts'], bootAttempts, reason: 'bootAttempts, on disk');
+  expect(json['manifestEtag'], manifestEtag, reason: 'manifestEtag, on disk');
+  expect(json['lastSequence'], lastSequence, reason: 'lastSequence, on disk');
+  expect(json['installId'], isA<String>(),
+      reason: 'a lost install id redraws the rollout bucket every launch');
+}
+
 void main() {
   late Directory root;
   late FakeCdn cdn;
@@ -76,6 +131,7 @@ void main() {
   }
 
   _rejectedManifestState(
+    root: () => root,
     cdn: () => cdn,
     makeClient: makeClient,
     total: total,
@@ -104,6 +160,14 @@ void main() {
 
       expect(observer.ofType<PatchInstalled>().single.number, 7);
       expect(observer.ofType<PatchActivated>().single.number, 7);
+
+      expectState(client, root,
+          installed: 7,
+          blocklist: const <int>{},
+          booting: 7,
+          bootAttempts: 1,
+          manifestEtag: null,
+          lastSequence: 1);
     });
 
     test('the patch survives a restart', () async {
@@ -121,6 +185,19 @@ void main() {
       expect(second.activePatch, 7);
       // The second run reads from disk; it must not re-download.
       expect(cdn.requests.where((r) => r.endsWith('.mfp')).length, 1);
+
+      // Re-armed, not inherited. markBootSuccessful cleared the token at the
+      // end of the first run; activating the patch again puts it back on trial
+      // for this run, because a patch that survived one launch can still take
+      // down the next. The count starts from one each time — that is what makes
+      // the guard measure consecutive failures rather than lifetime ones.
+      expectState(second, root,
+          installed: 7,
+          blocklist: const <int>{},
+          booting: 7,
+          bootAttempts: 1,
+          manifestEtag: null,
+          lastSequence: 1);
     });
 
     test('onNextLaunch leaves the running app alone', () async {
@@ -134,10 +211,28 @@ void main() {
       expect(observer.ofType<PatchInstalled>(), hasLength(1));
       expect(observer.ofType<PatchActivated>(), isEmpty);
 
+      // Installed but deliberately not booting: nothing was activated this
+      // session, so there is no launch to judge healthy or otherwise.
+      expectState(client, root,
+          installed: 7,
+          blocklist: const <int>{},
+          booting: null,
+          bootAttempts: 0,
+          manifestEtag: null,
+          lastSequence: 1);
+
       Patch.resetForTesting();
       final next = makeClient(activation: PatchActivation.onNextLaunch);
       await next.start();
       expect(total(20, 22), 84);
+
+      expectState(next, root,
+          installed: 7,
+          blocklist: const <int>{},
+          booting: 7,
+          bootAttempts: 1,
+          manifestEtag: null,
+          lastSequence: 1);
     });
 
     test('a newer patch replaces an older one', () async {
@@ -154,6 +249,16 @@ void main() {
       await client.checkForUpdate();
       expect(total(1, 1), 6);
       expect(client.activePatch, 8);
+
+      // The second publish advances the sequence, and the boot token moves to
+      // the patch that is now on trial rather than staying on the old one.
+      expectState(client, root,
+          installed: 8,
+          blocklist: const <int>{},
+          booting: 8,
+          bootAttempts: 1,
+          manifestEtag: null,
+          lastSequence: 2);
     });
 
     test('a second check with an unchanged manifest costs one 304', () async {
@@ -168,6 +273,16 @@ void main() {
       expect(decision, isA<StayOnCurrent>());
       expect(cdn.requests, ['/prod/manifest.json'],
           reason: 'a 304 must not pull the signature or any patch');
+
+      // A 304 returns before the decision switch, so nothing it might have
+      // written can have moved.
+      expectState(client, root,
+          installed: 7,
+          blocklist: const <int>{},
+          booting: 7,
+          bootAttempts: 1,
+          manifestEtag: 'W/"v7"',
+          lastSequence: 1);
     });
   });
 
@@ -189,6 +304,18 @@ void main() {
       expect(client.activePatch, 0);
       expect(observer.ofType<PatchBlocklisted>().single.reason,
           contains('signature'));
+
+      // Blocklisted, because these bytes will never be acceptable and fetching
+      // them again cannot change that. The sequence stays at zero: the decision
+      // was never carried out, so the manifest is not recorded as handled and
+      // the next check will look at it again.
+      expectState(client, root,
+          installed: 0,
+          blocklist: const <int>{7},
+          booting: null,
+          bootAttempts: 0,
+          manifestEtag: null,
+          lastSequence: 0);
     });
 
     test('a hash mismatch is caught before anything is parsed', () async {
@@ -202,6 +329,20 @@ void main() {
       expect(client.activePatch, 0);
       final rejected = observer.ofType<PatchRejectedEvent>().last;
       expect(rejected.reason, anyOf(contains('sha256'), contains('bytes')));
+
+      // Not blocklisted, and the difference from the tampered case is the whole
+      // point. A hash mismatch says the *transfer* was wrong — a truncated
+      // response, a cache serving something stale — and the bytes on the CDN
+      // may well be fine. Remembering this patch as broken would refuse a good
+      // one forever over one bad download. A signature failure is the opposite:
+      // those bytes are not acceptable and never will be.
+      expectState(client, root,
+          installed: 0,
+          blocklist: const <int>{},
+          booting: null,
+          bootAttempts: 0,
+          manifestEtag: null,
+          lastSequence: 0);
     });
 
     test('a patch for a different ABI is refused', () async {
@@ -217,6 +358,18 @@ void main() {
       expect(decision, isA<StayOnCurrent>());
       expect(decision.rejections.single.reason, contains('ABI'));
       expect(client.activePatch, 0);
+
+      // Nothing was wrong with the *manifest*, so the sequence advances and a
+      // later manifest is still expected. What must not happen is a blocklist
+      // entry: the patch is fine, it is simply for a different build, and
+      // remembering it as broken would refuse it forever on the build it fits.
+      expectState(client, root,
+          installed: 0,
+          blocklist: const <int>{},
+          booting: null,
+          bootAttempts: 0,
+          manifestEtag: null,
+          lastSequence: 1);
     });
 
     test('a v2 patch needing the Flutter bridge is refused, not crashed on',
@@ -249,6 +402,18 @@ void main() {
       expect(observer.ofType<PatchRejectedEvent>().last.reason,
           contains('signature'));
       expect(impostor.publicKey, isNot(cdn.publicKey));
+
+      // A manifest that failed verification must leave no trace at all — not
+      // its sequence, which would let a replay walk the high-water mark, and
+      // not its ETag, which would turn every later check into a 304 and make
+      // the refusal permanent.
+      expectState(client, root,
+          installed: 0,
+          blocklist: const <int>{},
+          booting: null,
+          bootAttempts: 0,
+          manifestEtag: null,
+          lastSequence: 0);
     });
 
     test('a patch outside the app version range is refused', () async {
@@ -277,6 +442,19 @@ void main() {
       expect(decision, isA<RollBackToBase>());
       expect(total(1, 1), 2, reason: 'the original code must be back');
       expect(client.activePatch, 0);
+
+      // A revocation is the publisher's decision, not this device's, so the
+      // patch is uninstalled but not blocklisted — a later manifest that
+      // un-revokes it can bring it back. The boot token has to be cleared with
+      // it, or the next launch counts a failure against a patch that is no
+      // longer even installed.
+      expectState(client, root,
+          installed: 0,
+          blocklist: const <int>{},
+          booting: null,
+          bootAttempts: 0,
+          manifestEtag: null,
+          lastSequence: 2);
     });
   });
 
@@ -354,8 +532,19 @@ void main() {
       await third.start();
       expect(total(1, 1), 2,
           reason: 'after the second failed boot the patch is abandoned');
-      expect(third.state.blocklist, contains(7));
       expect(observer.ofType<PatchBlocklisted>(), isNotEmpty);
+
+      // The guard's whole job is to leave a record that outlives the process.
+      // Checking only that the third run fell back would pass just as well if
+      // the blocklist were never written, and the fourth launch would install
+      // the patch all over again.
+      expectState(third, root,
+          installed: 0,
+          blocklist: const <int>{7},
+          booting: null,
+          bootAttempts: 0,
+          manifestEtag: null,
+          lastSequence: 1);
     });
 
     test('a blocklisted patch is not reinstalled from the same manifest',
@@ -374,6 +563,17 @@ void main() {
       expect(decision, isA<StayOnCurrent>());
       expect(decision.rejections.single.reason, contains('blocklisted'));
       expect(total(1, 1), 2);
+
+      // Refusing the patch is not enough on its own: the refusal has to be
+      // durable, and re-reading the same manifest must not quietly re-arm a
+      // boot attempt for something that is never going to be installed.
+      expectState(client, root,
+          installed: 0,
+          blocklist: const <int>{7},
+          booting: null,
+          bootAttempts: 0,
+          manifestEtag: null,
+          lastSequence: 1);
     });
 
     test('a healthy boot clears the token so the count does not creep up',
@@ -391,6 +591,18 @@ void main() {
       final client = makeClient();
       await client.start();
       expect(total(1, 1), 4, reason: 'five healthy runs must not blocklist');
+
+      // The defect this covers cleared the boot token on the retry path, so
+      // bootAttempts reset on every launch and the count never reached the
+      // threshold. It shows up only as a number on disk — the patch kept
+      // working, which is exactly why nothing else noticed.
+      expectState(client, root,
+          installed: 7,
+          blocklist: const <int>{},
+          booting: 7,
+          bootAttempts: 1,
+          manifestEtag: null,
+          lastSequence: 1);
     });
   });
 
@@ -415,6 +627,23 @@ int total(int a, int b) { return a ~/ 0; }
       await pumpEventQueue();
       expect(
           observer.ofType<PatchBlocklisted>().single.reason, contains('threw'));
+
+      // The event fires synchronously; the write that backs it does not, and
+      // pumping the event queue is not enough to land a file write. Waiting on
+      // the event alone is what let this test pass while the durable half of
+      // the decision was still in flight.
+      await client.settled;
+
+      // Dropping the patch for the rest of the session is only half of it. If
+      // the verdict is not written down, the next launch installs the same
+      // throwing patch and pays the failures again, forever.
+      expectState(client, root,
+          installed: 0,
+          blocklist: const <int>{7},
+          booting: null,
+          bootAttempts: 0,
+          manifestEtag: null,
+          lastSequence: 1);
     });
   });
 
@@ -429,8 +658,18 @@ int total(int a, int b) { return a ~/ 0; }
 
       await client.rollback();
       expect(total(1, 1), 2);
-      expect(client.state.blocklist, isEmpty,
-          reason: 'a manual rollback is not a verdict on the patch');
+
+      // A manual rollback is not a verdict on the patch: nothing is
+      // blocklisted, so the same manifest can install it again. The sequence
+      // stays where the successful check left it, because the rollback did not
+      // read a manifest at all.
+      expectState(client, root,
+          installed: 0,
+          blocklist: const <int>{},
+          booting: null,
+          bootAttempts: 0,
+          manifestEtag: null,
+          lastSequence: 1);
     });
 
     test('dispose closes the transport', () async {
@@ -532,9 +771,22 @@ int total(int a, int b) { return a ~/ 0; }
 
       final third = makeClient();
       await third.start();
-      expect(third.state.blocklist, isEmpty,
-          reason: 'a surviving file means nothing gets wrongly blocklisted');
       expect(total(1, 1), 4);
+
+      // The whole defect was a blocklist entry appearing for a patch that had
+      // never misbehaved, one launch after a rollback deleted its file. It is
+      // invisible in this session's behaviour and visible only here.
+      //
+      // Two boot attempts on #4, not one: the second run installed it and never
+      // confirmed a healthy boot, so this run is its second trial. That is the
+      // guard working — an unconfirmed launch is exactly what it counts.
+      expectState(third, root,
+          installed: 4,
+          blocklist: const <int>{},
+          booting: 4,
+          bootAttempts: 2,
+          manifestEtag: null,
+          lastSequence: 2);
     });
   });
 }
@@ -583,7 +835,17 @@ void _gaps({
       final client = makeClient();
       await client.start();
       await client.checkForUpdate();
-      expect(client.state.lastSequence, 0);
+
+      // The pair that has to move together. Recording the sequence for a
+      // manifest whose patch never installed would mark it handled, and the
+      // retry would then find nothing left to do.
+      expectState(client, root(),
+          installed: 0,
+          blocklist: const <int>{},
+          booting: null,
+          bootAttempts: 0,
+          manifestEtag: null,
+          lastSequence: 0);
     });
 
     test('a successful install records both', () async {
@@ -592,8 +854,14 @@ void _gaps({
       final client = makeClient();
       await client.start();
       await client.checkForUpdate();
-      expect(client.state.manifestEtag, 'W/"v1"');
-      expect(client.state.lastSequence, greaterThan(0));
+
+      expectState(client, root(),
+          installed: 7,
+          blocklist: const <int>{},
+          booting: 7,
+          bootAttempts: 1,
+          manifestEtag: 'W/"v1"',
+          lastSequence: 1);
     });
   });
 
@@ -616,7 +884,16 @@ void _gaps({
         reason: 'three overlapping calls must not fetch three times, and must '
             'not read-modify-write the same state concurrently',
       );
-      expect(client.state.installed, 7);
+
+      // One check's worth of state, not three interleaved read-modify-writes
+      // racing to clobber each other's fields.
+      expectState(client, root(),
+          installed: 7,
+          blocklist: const <int>{},
+          booting: 7,
+          bootAttempts: 1,
+          manifestEtag: null,
+          lastSequence: 1);
     });
 
     test('a later call still runs after the first completes', () async {
@@ -661,6 +938,7 @@ final class _ThrowingObserver implements PatchObserver {
 
 /// Second review round: what a rejected manifest leaves behind.
 void _rejectedManifestState({
+  required Directory Function() root,
   required FakeCdn Function() cdn,
   required MarinefordClient Function({
     String appVersion,
@@ -698,7 +976,18 @@ void _rejectedManifestState({
       final second = await client.checkForUpdate();
       expect(second, isA<ManifestRejected>());
       expect((second as ManifestRejected).reason, contains('stale'));
-      expect(client.state.lastSequence, 9);
+
+      // Not one field: the entire record has to be where the accepted manifest
+      // left it. A refusal that moved anything at all — the ETag, the boot
+      // token, the installed number — would be a refusal that the attacker got
+      // something out of.
+      expectState(client, root(),
+          installed: 7,
+          blocklist: const <int>{},
+          booting: 7,
+          bootAttempts: 1,
+          manifestEtag: null,
+          lastSequence: 9);
     });
 
     test('a manifest for another app cannot move this app\'s sequence',
@@ -713,9 +1002,13 @@ void _rejectedManifestState({
           appId: 'com.other.app', sequence: 2);
       await client.checkForUpdate();
 
-      expect(client.state.lastSequence, 9,
-          reason: 'another app signed with the same key must not reset this '
-              'app\'s high-water mark');
+      expectState(client, root(),
+          installed: 7,
+          blocklist: const <int>{},
+          booting: 7,
+          bootAttempts: 1,
+          manifestEtag: null,
+          lastSequence: 9);
     });
 
     test('a refused manifest does not record its ETag either', () async {
@@ -731,9 +1024,15 @@ void _rejectedManifestState({
           .publish({7: await cdn().buildPatch(_patchSource)}, sequence: 5);
       await client.checkForUpdate();
 
-      expect(client.state.manifestEtag, 'W/"good"',
-          reason: 'caching a manifest the client refused would make the '
-              'refusal permanent');
+      // Caching a manifest the client refused would make the refusal permanent:
+      // every later check becomes a 304 and the real manifest never gets read.
+      expectState(client, root(),
+          installed: 7,
+          blocklist: const <int>{},
+          booting: 7,
+          bootAttempts: 1,
+          manifestEtag: 'W/"good"',
+          lastSequence: 9);
     });
 
     test('a CDN that stops sending ETags does not leave a stale one behind',
@@ -752,8 +1051,14 @@ void _rejectedManifestState({
       await cdn().publish({8: await cdn().buildPatch(_otherPatchSource)});
       await client.checkForUpdate();
 
-      expect(client.state.manifestEtag, isNull,
-          reason: 'the server stopped tagging; the client must stop asking');
+      // The server stopped tagging; the client must stop asking.
+      expectState(client, root(),
+          installed: 8,
+          blocklist: const <int>{},
+          booting: 8,
+          bootAttempts: 1,
+          manifestEtag: null,
+          lastSequence: 2);
     });
   });
 }
