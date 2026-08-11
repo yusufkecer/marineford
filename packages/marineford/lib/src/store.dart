@@ -17,12 +17,14 @@ final class PatchState {
     this.booting,
     this.bootAttempts = 0,
     this.manifestEtag,
+    this.lastSequence = 0,
   });
 
   /// Stable random id for this install, used for rollout bucketing.
   ///
   /// Generated on first run and never sent anywhere — there is no server. It
-  /// exists so that "25% of devices" means a consistent 25%.
+  /// exists so that "25% of devices" means a consistent 25%, which only holds
+  /// if it genuinely survives restarts; see [PatchStore.readState].
   final String installId;
 
   /// Patch currently installed, or 0 for none.
@@ -40,8 +42,19 @@ final class PatchState {
   /// How many times [booting] has been attempted.
   final int bootAttempts;
 
-  /// ETag of the last manifest, so the usual check costs a 304 and no body.
+  /// ETag of the last manifest the client fully acted on.
+  ///
+  /// Only recorded once the decision has been carried out. Recording it earlier
+  /// means a failed download leaves the client sending `If-None-Match` for a
+  /// manifest it never finished processing, getting a 304, and never retrying.
   final String? manifestEtag;
+
+  /// Highest manifest sequence accepted so far.
+  ///
+  /// Anything at or below this is stale. Signatures never expire, so without
+  /// this an old manifest can be replayed forever — including one published
+  /// before a revocation.
+  final int lastSequence;
 
   /// Returns a copy with the given fields replaced.
   ///
@@ -55,6 +68,7 @@ final class PatchState {
     int? bootAttempts,
     String? manifestEtag,
     bool clearEtag = false,
+    int? lastSequence,
   }) =>
       PatchState(
         installId: installId,
@@ -63,6 +77,7 @@ final class PatchState {
         booting: clearBooting ? null : (booting ?? this.booting),
         bootAttempts: bootAttempts ?? this.bootAttempts,
         manifestEtag: clearEtag ? null : (manifestEtag ?? this.manifestEtag),
+        lastSequence: lastSequence ?? this.lastSequence,
       );
 
   /// Reads state from JSON, falling back to defaults for anything unreadable.
@@ -89,6 +104,8 @@ final class PatchState {
       manifestEtag: json['manifestEtag'] is String
           ? json['manifestEtag']! as String
           : null,
+      lastSequence:
+          json['lastSequence'] is int ? json['lastSequence']! as int : 0,
     );
   }
 
@@ -100,10 +117,11 @@ final class PatchState {
         if (booting != null) 'booting': booting,
         'bootAttempts': bootAttempts,
         if (manifestEtag != null) 'manifestEtag': manifestEtag,
+        'lastSequence': lastSequence,
       };
 
   @override
-  String toString() => 'PatchState(installed: $installed, '
+  String toString() => 'PatchState(installed: $installed, seq: $lastSequence, '
       'blocklist: $blocklist, booting: $booting/$bootAttempts)';
 }
 
@@ -125,21 +143,44 @@ final class PatchStore {
 
   File _patchFile(int number) => File(p.join(_patchDir.path, '$number.mfp'));
 
-  /// Reads persisted state, creating a fresh install id on first run.
+  /// Reads persisted state, creating and **saving** a fresh install id on first
+  /// run.
+  ///
+  /// The save is the point. An id that is invented on every read but never
+  /// written puts the device in a different rollout bucket on every launch, so
+  /// a 10% rollout becomes a 10% chance per launch rather than a stable 10% of
+  /// devices — and "raising the percentage only ever adds devices", the
+  /// property staged rollout rests on, stops being true.
   ///
   /// Returns defaults rather than throwing on a missing or corrupt file.
   Future<PatchState> readState() async {
-    final fallbackId = _newInstallId();
-    if (!_stateFile.existsSync()) return PatchState(installId: fallbackId);
+    final raw = await _readJsonOrNull();
+    if (raw == null) {
+      final fresh = PatchState(installId: _newInstallId());
+      await writeState(fresh);
+      return fresh;
+    }
+
+    final stored = raw['installId'];
+    final hasId = stored is String && stored.isNotEmpty;
+    final state = PatchState.fromJson(raw, hasId ? stored : _newInstallId());
+
+    // A missing or malformed id is repaired in place rather than by discarding
+    // the file. The rest of the state is worth far more than the id — losing
+    // the blocklist means happily reloading a patch that has already crashed
+    // the app twice.
+    if (!hasId) await writeState(state);
+    return state;
+  }
+
+  Future<Map<String, Object?>?> _readJsonOrNull() async {
+    if (!_stateFile.existsSync()) return null;
     try {
       final decoded = jsonDecode(await _stateFile.readAsString());
-      if (decoded is! Map<String, Object?>) {
-        return PatchState(installId: fallbackId);
-      }
-      return PatchState.fromJson(decoded, fallbackId);
+      return decoded is Map<String, Object?> ? decoded : null;
     } on Object {
       // Unreadable state is recoverable; a thrown exception here is not.
-      return PatchState(installId: fallbackId);
+      return null;
     }
   }
 
@@ -199,13 +240,24 @@ final class PatchStore {
     return numbers;
   }
 
-  /// Keeps the [keep] highest-numbered patches and deletes the rest.
+  /// Keeps the [keep] highest-numbered patches, and always keeps [protect].
   ///
-  /// Two is the useful default: the one running and the one to fall back to.
-  Future<void> prune({int keep = 2}) async {
+  /// [protect] is what makes this safe. Ranking by number alone deletes the
+  /// installed patch whenever the client has just moved *backwards* — which is
+  /// exactly what a revocation does. The next launch then finds the file
+  /// missing, treats that as a broken patch, and blocklists a patch that was
+  /// never broken.
+  Future<void> prune({int keep = 2, int protect = 0}) async {
     final stored = await storedPatches();
-    for (final number in stored.skip(keep)) {
-      await deletePatch(number);
+    // [protect] counts against the budget rather than sitting on top of it, so
+    // `keep` still means what it says.
+    final survivors = <int>{if (protect > 0) protect};
+    for (final number in stored) {
+      if (survivors.length >= keep) break;
+      survivors.add(number);
+    }
+    for (final number in stored) {
+      if (!survivors.contains(number)) await deletePatch(number);
     }
   }
 

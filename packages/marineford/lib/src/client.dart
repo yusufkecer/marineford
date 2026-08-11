@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -19,9 +18,10 @@ import 'transport.dart';
 ///
 /// The ordering here is the safety model, so it is worth stating plainly:
 /// signature before decompression, hash before parse, ABI before load, boot
-/// token before activation. Each of those is one step earlier than feels
-/// necessary, which is the point — every one of them guards against trusting
-/// bytes a step too soon.
+/// token before activation, and the ETag only after the decision has actually
+/// been carried out. Each is one step later or earlier than feels necessary,
+/// which is the point — every one of them guards against trusting something a
+/// step too soon.
 final class MarinefordClient {
   /// Creates a client. Prefer [Marineford.init].
   @visibleForTesting
@@ -42,6 +42,7 @@ final class MarinefordClient {
 
   PatchState? _state;
   Timer? _confirmTimer;
+  Future<PatchDecision>? _inFlight;
 
   /// Persisted state. Available after [start].
   PatchState get state =>
@@ -51,7 +52,17 @@ final class MarinefordClient {
   int get activePatch => Patch.isActive ? (_activeNumber ?? 0) : 0;
   int? _activeNumber;
 
-  void _emit(PatchEvent event) => config.observer?.onEvent(event);
+  /// Delivers an event without letting a bad observer break the client.
+  void _emit(PatchEvent event) {
+    final observer = config.observer;
+    if (observer == null) return;
+    try {
+      observer.onEvent(event);
+    } on Object {
+      // An observer that throws must not take down the patch pipeline. It is
+      // reporting on failures; it cannot be allowed to cause them.
+    }
+  }
 
   /// Recovers from the previous run and activates any pending patch.
   ///
@@ -79,18 +90,12 @@ final class MarinefordClient {
     // (markBootSuccessful) clears it.
     final booting = current.booting;
     if (booting != null && current.bootAttempts >= config.maxBootAttempts) {
-      _emit(PatchBlocklisted(
-          booting,
-          'failed to boot ${current.bootAttempts} times '
-          '(limit ${config.maxBootAttempts})'));
-      current = current.copyWith(
-        blocklist: {...current.blocklist, booting},
-        installed: current.installed == booting ? 0 : current.installed,
-        clearBooting: true,
-        bootAttempts: 0,
+      current = await _blocklist(
+        current,
+        booting,
+        'failed to boot ${current.bootAttempts} times '
+        '(limit ${config.maxBootAttempts})',
       );
-      await _store.deletePatch(booting);
-      await _store.writeState(current);
     }
 
     _state = current;
@@ -101,10 +106,35 @@ final class MarinefordClient {
     }
   }
 
+  /// The single place a patch is given up on.
+  ///
+  /// Blocklisting, clearing the installed slot, deactivating and deleting the
+  /// file all have to happen together; splitting them across call sites is how
+  /// a device ends up blocklisting a patch it is still running, or running one
+  /// it has blocklisted.
+  Future<PatchState> _blocklist(
+      PatchState from, int number, String reason) async {
+    _emit(PatchBlocklisted(number, reason));
+    if (_activeNumber == number) {
+      Patch.deactivate();
+      _activeNumber = null;
+    }
+    final next = from.copyWith(
+      blocklist: <int>{...from.blocklist, number},
+      installed: from.installed == number ? 0 : from.installed,
+      clearBooting: true,
+      bootAttempts: 0,
+    );
+    await _store.deletePatch(number);
+    await _store.writeState(next);
+    _state = next;
+    return next;
+  }
+
   Future<void> _activateStored(int number) async {
     final bytes = await _store.readPatch(number);
     if (bytes == null) {
-      await _abandon(number, 'patch file is missing from disk');
+      await _blocklist(state, number, 'patch file is missing from disk');
       return;
     }
     // Re-verify on every load rather than trusting that it was verified when it
@@ -124,13 +154,16 @@ final class MarinefordClient {
     try {
       container = MfpContainer.parse(bytes);
     } on MarinefordFormatException catch (e) {
-      await _abandon(number, e.message);
+      await _blocklist(state, number, e.message);
       return null;
     }
 
-    if (container.abi != config.abi) {
-      await _abandon(number,
-          'built against ABI ${container.abi}, this build is ${config.abi}');
+    if (container.abi != config.fingerprint) {
+      await _blocklist(
+          state,
+          number,
+          'built against ABI ${container.abi}, this build is '
+          '${config.fingerprint}');
       return null;
     }
 
@@ -139,7 +172,7 @@ final class MarinefordClient {
     final signatureOk =
         await _verifier.verify(container.signedRegion, container.signature);
     if (!signatureOk) {
-      await _abandon(number, 'signature does not verify');
+      await _blocklist(state, number, 'signature does not verify');
       return null;
     }
 
@@ -148,7 +181,7 @@ final class MarinefordClient {
           ? Uint8List.fromList(gzip.decode(container.payload))
           : container.payload;
     } on Object catch (e) {
-      await _abandon(number, 'payload could not be decompressed: $e');
+      await _blocklist(state, number, 'payload could not be decompressed: $e');
       return null;
     }
   }
@@ -170,8 +203,8 @@ final class MarinefordClient {
       onFailure: (id, error, stackTrace) {
         _emit(PatchFailure(id, error, stackTrace, Patch.failureCount));
         if (Patch.failureCount >= config.failureThreshold) {
-          unawaited(_abandon(
-              number, 'threw ${Patch.failureCount} times while running'));
+          unawaited(_blocklist(state, number,
+              'threw ${Patch.failureCount} times in a row while running'));
         }
       },
     );
@@ -198,9 +231,9 @@ final class MarinefordClient {
 
   /// Declares the current run healthy, clearing the crash-loop token.
   ///
-  /// Called automatically after [MarinefordConfig.autoConfirmBootAfter] unless that
-  /// is null. Call it yourself at the point your app is genuinely usable — a
-  /// timer cannot tell a working app from one stuck on a spinner.
+  /// Called automatically after [MarinefordConfig.autoConfirmBootAfter] unless
+  /// that is null. Call it yourself at the point your app is genuinely usable —
+  /// a timer cannot tell a working app from one stuck on a spinner.
   Future<void> markBootSuccessful() async {
     _confirmTimer?.cancel();
     _confirmTimer = null;
@@ -210,29 +243,20 @@ final class MarinefordClient {
     await _store.writeState(_state!);
   }
 
-  /// Stops using a patch and makes sure it is never picked again.
-  Future<void> _abandon(int number, String reason) async {
-    _emit(PatchBlocklisted(number, reason));
-    if (_activeNumber == number) {
-      Patch.deactivate();
-      _activeNumber = null;
-    }
-    final current = _state;
-    if (current != null) {
-      _state = current.copyWith(
-        blocklist: {...current.blocklist, number},
-        installed: current.installed == number ? 0 : current.installed,
-        clearBooting: true,
-      );
-      await _store.writeState(_state!);
-    }
-    await _store.deletePatch(number);
-  }
-
   /// Checks the manifest and installs whatever the rules allow.
   ///
-  /// Safe to call whenever. Never throws; failures become [PatchCheckFailed].
-  Future<PatchDecision> checkForUpdate() async {
+  /// Safe to call whenever, including concurrently: overlapping calls share one
+  /// in-flight check rather than racing to read-modify-write the same state.
+  /// Never throws; failures become [PatchCheckFailed].
+  Future<PatchDecision> checkForUpdate() {
+    final existing = _inFlight;
+    if (existing != null) return existing;
+    final future = _guardedCheck();
+    _inFlight = future;
+    return future.whenComplete(() => _inFlight = null);
+  }
+
+  Future<PatchDecision> _guardedCheck() async {
     try {
       return await _checkForUpdate();
     } on Object catch (error, stackTrace) {
@@ -247,7 +271,7 @@ final class MarinefordClient {
         ifNoneMatch: current.manifestEtag);
 
     if (response.notModified) {
-      _emit(const PatchRejected(0, 'manifest unchanged (304)'));
+      _emit(const ManifestUnchanged());
       return const StayOnCurrent();
     }
     if (!response.isOk) {
@@ -255,51 +279,62 @@ final class MarinefordClient {
           'manifest fetch returned HTTP ${response.statusCode}');
     }
 
-    // The manifest is signed detached, over its exact bytes. Verifying before
-    // parsing means the parser never runs on attacker-chosen input.
-    final signature = await _transport.get(_siblingUri('manifest.json.sig'));
-    if (!signature.isOk) {
-      throw PatchTransportException(
-          'manifest signature fetch returned HTTP ${signature.statusCode}');
-    }
-    if (!await _verifier.verify(response.body, signature.body)) {
-      _emit(const PatchRejected(0, 'manifest signature does not verify'));
+    // The manifest and its signature are one file. Parsing is structural only;
+    // nothing here is trusted until the signature over the exact signed bytes
+    // checks out.
+    final signed = SignedManifest.parse(response.body);
+    if (!await _verifier.verify(signed.signedBytes, signed.signature)) {
+      _emit(const PatchRejectedEvent(
+          null,
+          'manifest signature does not '
+          'verify'));
       return const StayOnCurrent();
     }
 
-    final manifest = PatchManifest.parse(utf8.decode(response.body));
-    _emit(ManifestLoaded(manifest, fromCache: false));
-
-    if (response.etag != null) {
-      _state = current.copyWith(manifestEtag: response.etag);
-      await _store.writeState(_state!);
-    }
+    final manifest = signed.manifest;
+    _emit(ManifestLoaded(manifest));
 
     final decision = selectPatch(
       manifest,
       SelectionContext(
         appId: config.appId,
-        abi: config.abi,
+        abi: config.fingerprint,
         appVersion: config.appVersion,
         installId: current.installId,
-        installedPatch: _state!.installed,
-        blocklist: _state!.blocklist,
+        installedPatch: current.installed,
+        blocklist: current.blocklist,
+        lastSequence: current.lastSequence,
       ),
     );
     _emit(DecisionMade(decision));
 
     switch (decision) {
       case ApplyPatch(entry: final entry):
-        await _download(entry);
+        final installed = await _download(entry);
+        if (!installed) return decision;
       case RollBackToBase(reason: final reason):
         await _rollBackToBase(reason);
       case StayOnCurrent():
         break;
     }
+
+    // Only now. Recording the ETag before the decision is carried out means a
+    // failed download leaves the client sending If-None-Match for a manifest it
+    // never finished with: the server answers 304, the check returns early, and
+    // the patch is never retried until the publisher happens to change the
+    // manifest again.
+    //
+    // The sequence advances on the same terms, and for the same reason.
+    _state = state.copyWith(
+      manifestEtag: response.etag,
+      lastSequence: manifest.sequence,
+    );
+    await _store.writeState(_state!);
     return decision;
   }
 
-  Future<void> _download(PatchEntry entry) async {
+  /// Returns whether the patch is now installed.
+  Future<bool> _download(PatchEntry entry) async {
     final url = config.manifestUrl.resolve(entry.url);
     final response = await _transport.get(url);
     if (!response.isOk) {
@@ -308,37 +343,42 @@ final class MarinefordClient {
     }
 
     if (response.body.length != entry.size) {
-      _emit(PatchRejected(
+      _emit(PatchRejectedEvent(
           entry.number,
           'downloaded ${response.body.length} bytes, manifest says '
           '${entry.size}'));
-      return;
+      return false;
     }
     if (!matchesSha256(response.body, entry.sha256)) {
-      _emit(PatchRejected(entry.number, 'sha256 does not match the manifest'));
-      return;
+      _emit(PatchRejectedEvent(
+          entry.number, 'sha256 does not match the manifest'));
+      return false;
     }
 
     // Prove it loads before recording it as installed. Writing first would let
     // a patch that fails ABI or signature checks occupy the installed slot and
     // have to be un-installed on the next launch.
     final program = await _openVerified(response.body, entry.number);
-    if (program == null) return;
+    if (program == null) return false;
 
     await _store.savePatch(entry.number, response.body);
     _state = state.copyWith(installed: entry.number);
     await _store.writeState(_state!);
-    await _store.prune(keep: config.retainPatches);
+    // `protect` is what stops a rollback from deleting the patch it just
+    // installed: after moving backwards the newly installed number is no longer
+    // the highest on disk.
+    await _store.prune(keep: config.retainPatches, protect: entry.number);
     _emit(PatchInstalled(entry.number, response.body.length));
 
     if (config.activation == PatchActivation.immediate) {
       await _writeBootToken(entry.number);
       _activateProgram(program, entry.number);
     }
+    return true;
   }
 
   Future<void> _rollBackToBase(String reason) async {
-    _emit(PatchRejected(_state?.installed ?? 0, reason));
+    _emit(PatchRejectedEvent(_state?.installed, reason));
     Patch.deactivate();
     _activeNumber = null;
     _state = state.copyWith(installed: 0, clearBooting: true, bootAttempts: 0);
@@ -348,8 +388,8 @@ final class MarinefordClient {
   /// Abandons the current patch and runs the store build.
   ///
   /// The patch stays on disk and is not blocklisted, so a later manifest can
-  /// legitimately reinstate it. Use [_abandon] semantics — via a publisher
-  /// revocation — when a patch should never come back.
+  /// legitimately reinstate it. Publisher revocation is what makes a patch never
+  /// come back.
   Future<void> rollback() async {
     await _rollBackToBase('rollback requested by the app');
   }
@@ -359,15 +399,6 @@ final class MarinefordClient {
     _confirmTimer?.cancel();
     _confirmTimer = null;
     _transport.close();
-  }
-
-  Uri _siblingUri(String name) {
-    final segments = [...config.manifestUrl.pathSegments];
-    if (segments.isEmpty) {
-      return config.manifestUrl.replace(pathSegments: [name]);
-    }
-    segments[segments.length - 1] = name;
-    return config.manifestUrl.replace(pathSegments: segments);
   }
 }
 
@@ -393,7 +424,8 @@ abstract final class Marineford {
   ///
   /// Await this before `runApp` so the first frame already reflects the patch.
   /// It reads two small files and, when a patch is present, builds a dart_eval
-  /// runtime — measured at 0.74ms, which is why it is safe on the startup path.
+  /// runtime — measured at about a millisecond, which is why it is safe on the
+  /// startup path.
   static Future<MarinefordClient> init(MarinefordConfig config) async {
     final root = await _channelDirectory(config.channel);
     final client = MarinefordClient(

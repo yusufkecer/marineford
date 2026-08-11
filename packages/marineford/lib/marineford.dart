@@ -14,18 +14,19 @@
 /// * A patch rewrites the marked function's whole body, so it can also repair
 ///   bugs in the unmarked helpers that function calls — it simply stops calling
 ///   them. Mark above the bug, not on it.
-/// * Marking costs ~2.4ns per call when no patch is active, against ~1.7ns
-///   unmarked. Mark categories, not individual suspects.
+/// * Marking costs a few nanoseconds per call when no patch is active. Mark
+///   categories, not individual suspects.
 /// * A single marked normalizer on your HTTP client's output absorbs almost any
 ///   backend contract change on its own.
 ///
 /// Never mark hot loops or per-frame code: crossing into the interpreter costs
-/// about 2.5µs, which is nothing for a screen's worth of logic and ruinous per
+/// microseconds, which is nothing for a screen's worth of logic and ruinous per
 /// list item.
 library;
 
 export 'package:marineford_core/marineford_core.dart'
     show
+        AbiFingerprint,
         ApplyPatch,
         MarinefordFormatException,
         PatchDecision,

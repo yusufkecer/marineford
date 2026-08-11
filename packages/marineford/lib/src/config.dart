@@ -1,4 +1,5 @@
 import 'package:dart_eval/dart_eval_bridge.dart' show EvalPlugin;
+import 'package:marineford_core/marineford_core.dart' show AbiFingerprint;
 import 'package:meta/meta.dart';
 import 'package:pub_semver/pub_semver.dart';
 
@@ -25,7 +26,11 @@ enum PatchActivation {
 @immutable
 final class MarinefordConfig {
   /// Creates a [MarinefordConfig].
-  const MarinefordConfig({
+  ///
+  /// Throws [FormatException] if [abi] is not a well-formed fingerprint. Not
+  /// const, so this validation happens here rather than the first time a patch
+  /// silently fails to match.
+  MarinefordConfig({
     required this.appId,
     required this.appVersion,
     required this.abi,
@@ -40,7 +45,7 @@ final class MarinefordConfig {
     this.observer,
     this.transport,
     this.plugins = const <EvalPlugin>[],
-  });
+  }) : fingerprint = AbiFingerprint.parse(abi);
 
   /// Application id. Must match the manifest, or the manifest is ignored.
   final String appId;
@@ -52,7 +57,14 @@ final class MarinefordConfig {
   ///
   /// A patch whose fingerprint differs is never loaded. This is what catches
   /// the case semver cannot: a method signature that changed between builds.
+  ///
+  /// Validated at construction rather than at first use: a malformed value here
+  /// is a build-configuration mistake, and finding out about it when the first
+  /// patch silently fails to match is far too late.
   final String abi;
+
+  /// [abi], parsed and validated at construction.
+  final AbiFingerprint fingerprint;
 
   /// Where `manifest.json` lives. `manifest.json.sig` must sit beside it.
   final Uri manifestUrl;

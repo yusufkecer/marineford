@@ -25,8 +25,8 @@ typedef PatchFailureHandler = void Function(
 /// Everything here is static and deliberately so: the hot path is a shim asking
 /// "is there a patch for me?", and that question has to cost essentially
 /// nothing when the answer is no. With no patch active it is one static field
-/// read against null — measured at 2.4ns against 1.7ns for calling the original
-/// function directly.
+/// read against null — measured at roughly 4ns against 2ns for calling the
+/// original function directly. See `bench/`.
 ///
 /// This class is not meant to be called by hand. Use `@patchable` or
 /// `@PatchableService` and let `marineford_gen` write the calls.
@@ -75,8 +75,8 @@ final class Patch {
   ///
   /// [slots] must already be filtered by version constraint — see
   /// [resolveSlots]. Resolving constraints here instead would put a
-  /// `VersionConstraint.parse` on every call, which measured 1.7µs of pure
-  /// waste per invocation.
+  /// `VersionConstraint.parse` on every call, which measured well over a
+  /// microsecond of pure waste per invocation.
   static void activate(
     Runtime runtime,
     Map<String, int> slots, {
@@ -139,8 +139,8 @@ final class Patch {
   /// Calls a patched function with any number of arguments.
   ///
   /// Allocates a list, so the fixed-arity variants are preferred where they
-  /// fit — that allocation is the difference between 12.7ns and 2.4ns on the
-  /// no-patch path in the original naive design.
+  /// fit — the allocation measures about 5ns against 4ns on the no-patch path,
+  /// and considerably more once a patch is live and the list actually escapes.
   static Object? invokeN(int offset, List<Object?> args, [String id = '']) {
     final runtime = _runtime;
     if (runtime == null) return null;
@@ -167,6 +167,12 @@ final class Patch {
       } else {
         raw = runtime.execute(offset);
       }
+      // A call that came back is evidence the patch works. Without this the
+      // count is cumulative over the whole session, so a patch that throws once
+      // an hour on one rare input eventually crosses the threshold and is
+      // abandoned despite being right the rest of the time. The threshold means
+      // consecutive failures.
+      _failureCount = 0;
       if (raw == null) return patchedNull;
       if (raw is $Value) {
         return raw.$reified ?? patchedNull;
@@ -179,7 +185,12 @@ final class Patch {
       _recordFailure(id, error, stackTrace);
       return null;
     } finally {
-      _depth--;
+      // Clamped rather than a plain decrement: _recordFailure can deactivate
+      // mid-flight, and deactivate resets the depth while this frame is still
+      // on the stack. An unclamped decrement would take it negative, and then
+      // the `== 0` below would never fire again and arguments would accumulate
+      // forever.
+      if (_depth > 0) _depth--;
       if (_depth == 0) {
         // A throw can leave arguments pushed for a frame that never started.
         // Only safe to clear at the outermost level; an inner frame's failure
@@ -191,11 +202,20 @@ final class Patch {
 
   static void _recordFailure(String id, Object error, StackTrace stackTrace) {
     _failureCount++;
-    _onFailure?.call(id, error, stackTrace);
+    final handler = _onFailure;
+    if (handler != null) {
+      try {
+        handler(id, error, stackTrace);
+      } on Object {
+        // An observer that throws must not turn a handled patch failure into an
+        // unhandled one. Whatever it was trying to report is already lost; the
+        // fallback path is not.
+      }
+    }
     if (_failureCount >= _failureThreshold) {
-      // A patch that has thrown this many times is not going to start working.
-      // Drop it for the rest of the session; the client blocklists it on disk
-      // so the next launch does not pay for it again.
+      // A patch that has thrown this many times in a row is not going to start
+      // working. Drop it for the rest of the session; the client blocklists it
+      // on disk so the next launch does not pay for it again.
       deactivate();
     }
   }

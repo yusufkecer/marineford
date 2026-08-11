@@ -21,6 +21,7 @@ Runtime compile(String source) {
 
 void main() {
   tearDown(Patch.resetForTesting);
+  _gaps();
 
   group('no patch active', () {
     test('slot lookups return null', () {
@@ -220,5 +221,120 @@ int a() { return 1; }
       slots['#injected'] = 0;
       expect(Patch.slot('#injected'), isNull);
     });
+  });
+}
+
+/// Gaps the review named.
+void _gaps() {
+  tearDown(Patch.resetForTesting);
+
+  Runtime compiled(String source) {
+    final program = Compiler().compile(<String, Map<String, String>>{
+      'p': <String, String>{'main.dart': '$_header\n$source'},
+    });
+    return Runtime(program.write().buffer.asByteData())..loadGlobalOverrides();
+  }
+
+  group('failure counting is consecutive, not cumulative', () {
+    late Runtime runtime;
+
+    setUp(() {
+      runtime = compiled('''
+@RuntimeOverride('#boom', version: '>=1.0.0')
+int boom(int a) { return a ~/ 0; }
+
+@RuntimeOverride('#fine', version: '>=1.0.0')
+int fine(int a) { return a + 1; }
+''');
+      Patch.activate(runtime, resolveSlots(runtime, Version.parse('1.0.0')),
+          failureThreshold: 3);
+    });
+
+    test('a success resets the count', () {
+      // Cumulative counting abandons a patch that is right 99.99% of the time
+      // because it threw on a rare input a few times over a long session.
+      for (var i = 0; i < 2; i++) {
+        Patch.invoke1(Patch.slot('#boom')!, 5, '#boom');
+      }
+      expect(Patch.failureCount, 2);
+      Patch.invoke1(Patch.slot('#fine')!, 1);
+      expect(Patch.failureCount, 0);
+      expect(Patch.isActive, isTrue);
+    });
+
+    test('interleaved failures never reach the threshold', () {
+      for (var i = 0; i < 10; i++) {
+        Patch.invoke1(Patch.slot('#boom')!, 5, '#boom');
+        Patch.invoke1(Patch.slot('#fine')!, 1);
+      }
+      expect(Patch.isActive, isTrue);
+    });
+
+    test('consecutive failures still deactivate', () {
+      for (var i = 0; i < 3; i++) {
+        Patch.invoke1(Patch.slot('#boom')!, 5, '#boom');
+      }
+      expect(Patch.isActive, isFalse);
+    });
+  });
+
+  group('deactivating mid-call leaves nothing behind', () {
+    test('the depth does not go negative and arguments are cleared', () {
+      // deactivate() resets the depth while _run's finally is still on the
+      // stack. An unclamped decrement took it to -1, after which the "am I the
+      // outermost frame" test never fired again and arguments accumulated
+      // forever.
+      final runtime = compiled('''
+@RuntimeOverride('#boom', version: '>=1.0.0')
+int boom(int a) { return a ~/ 0; }
+
+@RuntimeOverride('#fine', version: '>=1.0.0')
+int fine(int a) { return a + 1; }
+''');
+      Patch.activate(runtime, resolveSlots(runtime, Version.parse('1.0.0')),
+          failureThreshold: 1);
+
+      final slot = Patch.slot('#boom')!;
+      Patch.invoke1(slot, 5, '#boom');
+      expect(Patch.isActive, isFalse, reason: 'threshold of one');
+      expect(runtime.args, isEmpty,
+          reason: 'the failed call must not leave its argument behind');
+
+      // Re-activating has to produce a usable dispatcher, not one stuck at a
+      // negative depth.
+      Patch.activate(runtime, resolveSlots(runtime, Version.parse('1.0.0')));
+      expect(Patch.invoke1(Patch.slot('#fine')!, 41), 42);
+      expect(runtime.args, isEmpty);
+    });
+
+    test('a nested throw still leaves the argument stack clean', () {
+      final runtime = compiled('''
+@RuntimeOverride('#outer', version: '>=1.0.0')
+int outer(int a) { return inner(a) + 1; }
+
+@RuntimeOverride('#inner', version: '>=1.0.0')
+int inner(int a) { return a ~/ 0; }
+''');
+      Patch.activate(runtime, resolveSlots(runtime, Version.parse('1.0.0')),
+          failureThreshold: 99);
+
+      expect(Patch.invoke1(Patch.slot('#outer')!, 5, '#outer'), isNull);
+      expect(runtime.args, isEmpty);
+      expect(Patch.invoke1(Patch.slot('#outer')!, 5, '#outer'), isNull,
+          reason: 'a second attempt must behave the same as the first');
+    });
+  });
+
+  test('a throwing failure handler does not escape', () {
+    final runtime = compiled('''
+@RuntimeOverride('#boom', version: '>=1.0.0')
+int boom(int a) { return a ~/ 0; }
+''');
+    Patch.activate(
+      runtime,
+      resolveSlots(runtime, Version.parse('1.0.0')),
+      onFailure: (_, __, ___) => throw StateError('handler is broken'),
+    );
+    expect(() => Patch.invoke1(Patch.slot('#boom')!, 5), returnsNormally);
   });
 }

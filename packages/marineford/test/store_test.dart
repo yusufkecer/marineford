@@ -7,6 +7,8 @@ import 'package:marineford/marineford.dart';
 import 'package:path/path.dart' as p;
 
 void main() {
+  _gaps();
+
   late Directory root;
   late PatchStore store;
 
@@ -159,5 +161,101 @@ void main() {
       await store.clear();
       expect(root.existsSync(), isFalse);
     });
+  });
+}
+
+/// Gaps the review named.
+void _gaps() {
+  late Directory root;
+  late PatchStore store;
+
+  setUp(() {
+    root = Directory.systemTemp.createTempSync('marineford_gaps');
+    store = PatchStore(root);
+  });
+
+  tearDown(() {
+    try {
+      if (root.existsSync()) root.deleteSync(recursive: true);
+    } on FileSystemException {
+      // Windows holds handles briefly.
+    }
+  });
+
+  group('installId persistence', () {
+    test('the id survives a restart even if nothing else happens', () async {
+      // The bug: the id was invented on every read and never written, so a
+      // device landed in a different rollout bucket on every launch and
+      // "10% of devices" became "10% chance per launch".
+      final first = await store.readState();
+      final second = await PatchStore(root).readState();
+      expect(second.installId, first.installId);
+    });
+
+    test('reading persists it immediately, without any other write', () async {
+      final state = await store.readState();
+      final raw = File(p.join(root.path, 'state.json')).readAsStringSync();
+      expect(raw, contains(state.installId));
+    });
+
+    test('a malformed id is repaired without discarding the rest', () async {
+      await store.writeState(const PatchState(
+          installId: 'x', installed: 7, blocklist: <int>{3, 4}));
+      final file = File(p.join(root.path, 'state.json'));
+      file.writeAsStringSync(file
+          .readAsStringSync()
+          .replaceAll('"installId":"x"', '"installId":9'));
+
+      final repaired = await PatchStore(root).readState();
+      expect(repaired.installId, isNotEmpty);
+      expect(repaired.blocklist, <int>{3, 4},
+          reason: 'forgetting the blocklist means reloading a patch that has '
+              'already crashed the app');
+      expect(repaired.installed, 7);
+      expect((await PatchStore(root).readState()).installId, repaired.installId,
+          reason: 'the repair has to be written, not just returned');
+    });
+  });
+
+  group('prune protects the installed patch', () {
+    Uint8List bytes() => Uint8List.fromList(<int>[1, 2, 3]);
+
+    test('keeps the protected patch even when it is not the highest', () async {
+      for (final n in <int>[4, 7, 9]) {
+        await store.savePatch(n, bytes());
+      }
+      await store.prune(keep: 2, protect: 4);
+      expect(await store.storedPatches(), <int>[9, 4]);
+    });
+
+    test('protect counts against keep rather than adding to it', () async {
+      for (final n in <int>[1, 2, 3, 4, 5]) {
+        await store.savePatch(n, bytes());
+      }
+      await store.prune(keep: 2, protect: 1);
+      expect(await store.storedPatches(), hasLength(2));
+      expect(await store.storedPatches(), contains(1));
+    });
+
+    test('keep of one leaves only the protected patch', () async {
+      for (final n in <int>[4, 9]) {
+        await store.savePatch(n, bytes());
+      }
+      await store.prune(keep: 1, protect: 4);
+      expect(await store.storedPatches(), <int>[4]);
+    });
+
+    test('with nothing to protect it is the plain newest-first rule', () async {
+      for (final n in <int>[1, 2, 3]) {
+        await store.savePatch(n, bytes());
+      }
+      await store.prune(keep: 2);
+      expect(await store.storedPatches(), <int>[3, 2]);
+    });
+  });
+
+  test('the sequence round-trips', () async {
+    await store.writeState(const PatchState(installId: 'a', lastSequence: 42));
+    expect((await PatchStore(root).readState()).lastSequence, 42);
   });
 }

@@ -10,24 +10,33 @@ import 'package:meta/meta.dart';
 /// fail on every device in the field without you ever finding out — that is the
 /// real cost of the static-hosting decision, and it is worth being explicit
 /// about.
+///
+/// An observer that throws is caught and ignored. It is reporting on failures;
+/// it cannot be allowed to cause them.
 sealed class PatchEvent {
   const PatchEvent();
 }
 
-/// A manifest was fetched and read.
+/// A manifest was fetched, verified and read.
 final class ManifestLoaded extends PatchEvent {
   /// Creates a [ManifestLoaded] event.
-  const ManifestLoaded(this.manifest, {required this.fromCache});
+  const ManifestLoaded(this.manifest);
 
   /// The manifest that was read.
   final PatchManifest manifest;
 
-  /// Whether the server answered 304 and the cached copy was reused.
-  final bool fromCache;
+  @override
+  String toString() => 'ManifestLoaded(#${manifest.sequence}, '
+      '${manifest.patches.length} patches)';
+}
+
+/// The server answered 304 and the manifest has not changed.
+final class ManifestUnchanged extends PatchEvent {
+  /// Creates a [ManifestUnchanged] event.
+  const ManifestUnchanged();
 
   @override
-  String toString() =>
-      'ManifestLoaded(${manifest.patches.length} patches, cached: $fromCache)';
+  String toString() => 'ManifestUnchanged()';
 }
 
 /// The check ran and produced a decision.
@@ -72,8 +81,8 @@ final class PatchActivated extends PatchEvent {
   final Duration elapsed;
 
   @override
-  String toString() =>
-      'PatchActivated(#$number, $overrides overrides, ${elapsed.inMilliseconds}ms)';
+  String toString() => 'PatchActivated(#$number, $overrides overrides, '
+      '${elapsed.inMilliseconds}ms)';
 }
 
 /// Interpreted code threw. The original function ran instead.
@@ -90,26 +99,29 @@ final class PatchFailure extends PatchEvent {
   /// Where.
   final StackTrace stackTrace;
 
-  /// How many failures this patch has produced so far.
+  /// How many times in a row this patch has failed.
   final int count;
 
   @override
   String toString() => 'PatchFailure($id, #$count): $error';
 }
 
-/// A patch was refused, or abandoned after being installed.
-final class PatchRejected extends PatchEvent {
-  /// Creates a [PatchRejected] event.
-  const PatchRejected(this.number, this.reason);
+/// A patch or a manifest was refused.
+final class PatchRejectedEvent extends PatchEvent {
+  /// Creates a [PatchRejectedEvent].
+  const PatchRejectedEvent(this.number, this.reason);
 
-  /// Patch number, or 0 when the rejection was not about a specific patch.
-  final int number;
+  /// Patch number, or null when the rejection was about the manifest rather
+  /// than any one patch.
+  final int? number;
 
   /// Why.
   final String reason;
 
   @override
-  String toString() => 'PatchRejected(#$number): $reason';
+  String toString() => number == null
+      ? 'PatchRejectedEvent(manifest): $reason'
+      : 'PatchRejectedEvent(#$number): $reason';
 }
 
 /// A patch was blocklisted locally and will never be loaded again.
@@ -147,7 +159,7 @@ final class PatchCheckFailed extends PatchEvent {
 /// Implement this and hand it to the client to get patch activity into your
 /// existing logging or crash reporting.
 abstract interface class PatchObserver {
-  /// Called for every event. Must not throw; the client does not guard you.
+  /// Called for every event. May throw; the client catches and ignores it.
   void onEvent(PatchEvent event);
 }
 

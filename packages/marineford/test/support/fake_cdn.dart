@@ -15,14 +15,16 @@ final class FakeCdn implements PatchTransport {
   FakeCdn._(this.signer, this.abi);
 
   /// Creates a CDN with a fresh signing key.
-  static Future<FakeCdn> create({String? abi}) async =>
-      FakeCdn._(await PatchSigner.generate(), abi ?? 'sha256:${'a' * 64}');
+  static Future<FakeCdn> create({AbiFingerprint? abi}) async => FakeCdn._(
+        await PatchSigner.generate(),
+        abi ?? AbiFingerprint.parse('sha256:${'a' * 64}'),
+      );
 
   /// The publisher's key.
   final PatchSigner signer;
 
-  /// ABI fingerprint stamped into everything this CDN publishes.
-  final String abi;
+  /// Fingerprint stamped into everything this CDN publishes.
+  final AbiFingerprint abi;
 
   /// Base64 public key, as it would be pasted into an app.
   String get publicKey => signer.publicKeyBase64;
@@ -41,18 +43,19 @@ final class FakeCdn implements PatchTransport {
   /// Status code to return for the next manifest fetch, or null for normal.
   int? manifestStatusOverride;
 
+  /// Paths that should fail once, then behave normally.
+  final Set<String> failOnce = <String>{};
+
   int _closeCount = 0;
+  int _sequence = 0;
 
   /// How many times the client closed this transport.
   int get closeCount => _closeCount;
 
   /// Compiles [source] into a signed container and returns its bytes.
-  ///
-  /// [source] is patch-package Dart: top-level functions annotated with
-  /// `@RuntimeOverride`.
   Future<Uint8List> buildPatch(
     String source, {
-    String? abiOverride,
+    AbiFingerprint? abiOverride,
     MfpFlags flags = MfpFlags.gzip,
     int schema = 1,
   }) async {
@@ -63,8 +66,8 @@ class RuntimeOverride {
   final String? version;
 }
 ''';
-    final program = Compiler().compile({
-      'patch': {'main.dart': '$header\n$source'},
+    final program = Compiler().compile(<String, Map<String, String>>{
+      'patch': <String, String>{'main.dart': '$header\n$source'},
     });
     final evc = program.write();
     final payload =
@@ -72,25 +75,27 @@ class RuntimeOverride {
 
     final region = MfpContainer.buildSignedRegion(
       payload: payload,
-      abiHash: _abiBytes(abiOverride ?? abi),
+      abi: abiOverride ?? abi,
       flags: flags,
       schema: schema,
     );
     final signature = await signer.sign(region);
-    return Uint8List.fromList([...region, ...signature]);
+    return Uint8List.fromList(<int>[...region, ...signature]);
   }
 
   /// Publishes [patches] and the manifest that describes them.
   ///
-  /// Each entry maps a patch number to its container bytes.
+  /// The sequence advances on every call, the way the real publisher does.
   Future<void> publish(
     Map<int, Uint8List> patches, {
     Set<int> revoked = const <int>{},
     String appId = 'com.example.app',
     String runtime = '>=1.0.0 <2.0.0',
     double rollout = 1.0,
-    Map<int, String> abiPerPatch = const <int, String>{},
+    Map<int, AbiFingerprint> abiPerPatch = const <int, AbiFingerprint>{},
+    int? sequence,
   }) async {
+    _sequence = sequence ?? _sequence + 1;
     final entries = <Map<String, Object?>>[];
     patches.forEach((number, bytes) {
       _files['/prod/$number.mfp'] = bytes;
@@ -99,24 +104,25 @@ class RuntimeOverride {
         'url': '$number.mfp',
         'size': bytes.length,
         'sha256': sha256Hex(bytes),
-        'abi': abiPerPatch[number] ?? abi,
+        'abi': (abiPerPatch[number] ?? abi).toString(),
         'runtime': runtime,
         'rollout': rollout,
       });
     });
 
-    final manifest = utf8.encode(jsonEncode(<String, Object?>{
-      'schema': 1,
-      'app': appId,
-      'channel': 'prod',
-      'generatedAt': '2026-08-10T12:00:00Z',
-      'patches': entries,
-      'revoked': revoked.toList(),
-    }));
-    _files['/prod/manifest.json'] = Uint8List.fromList(manifest);
-    _files['/prod/manifest.json.sig'] = await signer.sign(
-      Uint8List.fromList(manifest),
-    );
+    final signedBytes = Uint8List.fromList(utf8.encode(jsonEncode(
+      <String, Object?>{
+        'schema': 1,
+        'app': appId,
+        'channel': 'prod',
+        'sequence': _sequence,
+        'generatedAt': '2026-08-11T12:00:00Z',
+        'patches': entries,
+        'revoked': revoked.toList(),
+      },
+    )));
+    _files['/prod/manifest.json'] =
+        SignedManifest.encode(signedBytes, await signer.sign(signedBytes));
   }
 
   /// Replaces a served file with arbitrary bytes, simulating tampering or a
@@ -129,6 +135,10 @@ class RuntimeOverride {
   @override
   Future<TransportResponse> get(Uri url, {String? ifNoneMatch}) async {
     requests.add(url.path);
+
+    if (failOnce.remove(url.path)) {
+      throw const PatchTransportException('simulated network failure');
+    }
 
     if (url.path.endsWith('manifest.json')) {
       final override = manifestStatusOverride;
@@ -154,12 +164,4 @@ class RuntimeOverride {
 
   @override
   void close() => _closeCount++;
-
-  static Uint8List _abiBytes(String abi) {
-    final hex = abi.substring('sha256:'.length);
-    return Uint8List.fromList(<int>[
-      for (var i = 0; i < 32; i++)
-        int.parse(hex.substring(i * 2, i * 2 + 2), radix: 16),
-    ]);
-  }
 }

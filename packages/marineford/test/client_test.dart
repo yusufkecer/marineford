@@ -51,7 +51,7 @@ void main() {
         config: MarinefordConfig(
           appId: 'com.example.app',
           appVersion: Version.parse(appVersion),
-          abi: abi ?? cdn.abi,
+          abi: abi ?? cdn.abi.toString(),
           manifestUrl: cdn.manifestUrl,
           publicKey: cdn.publicKey,
           activation: activation,
@@ -73,6 +73,14 @@ void main() {
     }
     return a + b; // the original
   }
+
+  _gaps(
+    root: () => root,
+    cdn: () => cdn,
+    observer: () => observer,
+    makeClient: makeClient,
+    total: total,
+  );
 
   group('happy path', () {
     test('downloads, verifies, installs and dispatches', () async {
@@ -185,12 +193,12 @@ void main() {
       await client.checkForUpdate();
 
       expect(client.activePatch, 0);
-      final rejected = observer.ofType<PatchRejected>().last;
+      final rejected = observer.ofType<PatchRejectedEvent>().last;
       expect(rejected.reason, anyOf(contains('sha256'), contains('bytes')));
     });
 
     test('a patch for a different ABI is refused', () async {
-      final otherAbi = 'sha256:${'b' * 64}';
+      final otherAbi = AbiFingerprint.parse('sha256:${'b' * 64}');
       await cdn.publish(
         {7: await cdn.buildPatch(_patchSource, abiOverride: otherAbi)},
         abiPerPatch: {7: otherAbi},
@@ -220,17 +228,19 @@ void main() {
     });
 
     test('a manifest signed by the wrong key is ignored', () async {
-      await cdn.publish({7: await cdn.buildPatch(_patchSource)});
+      // A whole channel published by someone else's key, served at our URL.
       final impostor = await FakeCdn.create(abi: cdn.abi);
-      cdn.corrupt('/prod/manifest.json.sig', Uint8List(64));
+      await impostor.publish({7: await impostor.buildPatch(_patchSource)});
+      cdn.corrupt(
+          '/prod/manifest.json', (await impostor.get(cdn.manifestUrl)).body);
 
       final client = makeClient();
       await client.start();
       final decision = await client.checkForUpdate();
 
       expect(decision, isA<StayOnCurrent>());
-      expect(
-          observer.ofType<PatchRejected>().last.reason, contains('signature'));
+      expect(observer.ofType<PatchRejectedEvent>().last.reason,
+          contains('signature'));
       expect(impostor.publicKey, isNot(cdn.publicKey));
     });
 
@@ -274,9 +284,9 @@ void main() {
       expect(observer.ofType<PatchCheckFailed>(), hasLength(1));
     });
 
-    test('a missing signature file leaves everything alone', () async {
+    test('a network failure mid-check leaves everything alone', () async {
       await cdn.publish({7: await cdn.buildPatch(_patchSource)});
-      cdn.remove('/prod/manifest.json.sig');
+      cdn.failOnce.add('/prod/manifest.json');
 
       final client = makeClient();
       await client.start();
@@ -437,5 +447,158 @@ int total(int a, int b) { return a ~/ 0; }
       }
       expect(await store.storedPatches(), hasLength(lessThanOrEqualTo(2)));
     });
+
+    test('pruning never deletes the patch that was just installed', () async {
+      // The case ranking by number alone gets wrong. After a revocation the
+      // client moves *backwards*, so the newly installed patch is no longer the
+      // highest on disk — and deleting it makes the next launch find the file
+      // missing and blocklist a patch that was never broken.
+      final store = PatchStore(root);
+      final good = await cdn.buildPatch(_patchSource);
+      final newer = await cdn.buildPatch(_otherPatchSource);
+
+      await cdn.publish({4: good, 7: newer});
+      final first = makeClient();
+      await first.start();
+      await first.checkForUpdate();
+      await first.markBootSuccessful();
+      expect(first.state.installed, 7);
+      Patch.resetForTesting();
+
+      await cdn.publish({4: good, 7: newer}, revoked: {7});
+      final second = makeClient();
+      await second.start();
+      await second.checkForUpdate();
+      expect(second.state.installed, 4);
+      expect(await store.readPatch(4), isNotNull,
+          reason: 'the patch the client just rolled back onto must survive');
+      Patch.resetForTesting();
+
+      final third = makeClient();
+      await third.start();
+      expect(third.state.blocklist, isEmpty,
+          reason: 'a surviving file means nothing gets wrongly blocklisted');
+      expect(total(1, 1), 4);
+    });
   });
+}
+
+/// Gaps the review named, each pinned to the defect it covers.
+void _gaps({
+  required Directory Function() root,
+  required FakeCdn Function() cdn,
+  required RecordingObserver Function() observer,
+  required MarinefordClient Function({
+    String appVersion,
+    String? abi,
+    PatchActivation activation,
+    int maxBootAttempts,
+    int failureThreshold,
+  }) makeClient,
+  required int Function(int, int) total,
+}) {
+  group('a failed download does not wedge the device', () {
+    test('the ETag is not recorded until the decision is carried out',
+        () async {
+      // The bug: the ETag was written before the download ran. A transient
+      // failure then left the client sending If-None-Match for a manifest it
+      // never finished with, getting a 304 forever, and never retrying.
+      cdn().etag = 'W/"v1"';
+      await cdn().publish({7: await cdn().buildPatch(_patchSource)});
+      cdn().failOnce.add('/prod/7.mfp');
+
+      final client = makeClient();
+      await client.start();
+      await client.checkForUpdate();
+      expect(client.state.manifestEtag, isNull,
+          reason: 'nothing was installed, so nothing should be remembered');
+      expect(total(1, 1), 2);
+
+      // Second attempt, same unchanged manifest. It must actually retry.
+      final decision = await client.checkForUpdate();
+      expect(decision, isA<ApplyPatch>());
+      expect(total(1, 1), 4);
+    });
+
+    test('a rejected patch does not advance the sequence either', () async {
+      await cdn().publish({7: await cdn().buildPatch(_patchSource)});
+      cdn().corrupt('/prod/7.mfp', Uint8List.fromList(List.filled(200, 0x41)));
+
+      final client = makeClient();
+      await client.start();
+      await client.checkForUpdate();
+      expect(client.state.lastSequence, 0);
+    });
+
+    test('a successful install records both', () async {
+      cdn().etag = 'W/"v1"';
+      await cdn().publish({7: await cdn().buildPatch(_patchSource)});
+      final client = makeClient();
+      await client.start();
+      await client.checkForUpdate();
+      expect(client.state.manifestEtag, 'W/"v1"');
+      expect(client.state.lastSequence, greaterThan(0));
+    });
+  });
+
+  group('concurrent checks', () {
+    test('overlapping calls share one check rather than racing', () async {
+      await cdn().publish({7: await cdn().buildPatch(_patchSource)});
+      final client = makeClient();
+      await client.start();
+
+      final results = await Future.wait(<Future<PatchDecision>>[
+        client.checkForUpdate(),
+        client.checkForUpdate(),
+        client.checkForUpdate(),
+      ]);
+
+      expect(results.every((d) => d is ApplyPatch), isTrue);
+      expect(
+        cdn().requests.where((r) => r.endsWith('manifest.json')).length,
+        1,
+        reason: 'three overlapping calls must not fetch three times, and must '
+            'not read-modify-write the same state concurrently',
+      );
+      expect(client.state.installed, 7);
+    });
+
+    test('a later call still runs after the first completes', () async {
+      await cdn().publish({7: await cdn().buildPatch(_patchSource)});
+      final client = makeClient();
+      await client.start();
+      await client.checkForUpdate();
+      cdn().requests.clear();
+      await client.checkForUpdate();
+      expect(cdn().requests, isNotEmpty);
+    });
+  });
+
+  group('a throwing observer cannot break the client', () {
+    test('the patch still installs and dispatches', () async {
+      await cdn().publish({7: await cdn().buildPatch(_patchSource)});
+      final client = MarinefordClient(
+        config: MarinefordConfig(
+          appId: 'com.example.app',
+          appVersion: Version.parse('1.4.0'),
+          abi: cdn().abi.toString(),
+          manifestUrl: cdn().manifestUrl,
+          publicKey: cdn().publicKey,
+          activation: PatchActivation.immediate,
+          autoConfirmBootAfter: null,
+          observer: _ThrowingObserver(),
+        ),
+        store: PatchStore(root()),
+        transport: cdn(),
+      );
+      await client.start();
+      expect(await client.checkForUpdate(), isA<ApplyPatch>());
+      expect(total(1, 1), 4);
+    });
+  });
+}
+
+final class _ThrowingObserver implements PatchObserver {
+  @override
+  void onEvent(PatchEvent event) => throw StateError('observer is broken');
 }
