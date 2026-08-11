@@ -11,6 +11,7 @@ final class SelectionContext {
   /// Creates a [SelectionContext].
   const SelectionContext({
     required this.appId,
+    required this.channel,
     required this.abi,
     required this.appVersion,
     required this.installId,
@@ -21,6 +22,17 @@ final class SelectionContext {
 
   /// Application id this build expects the manifest to be for.
   final String appId;
+
+  /// Release channel this build expects the manifest to be for.
+  ///
+  /// Checked for the same reason as [appId], and more likely to be wrong. The
+  /// client uses its channel only to name a directory on disk; the manifest URL
+  /// is a separate field nobody cross-checks. So an app configured for `prod`
+  /// whose URL ends in `/beta/manifest.json` installed beta patches, wrote them
+  /// into the prod directory, and every layer agreed with every other. Beta code
+  /// reaching a production user is the one thing the idea of a channel exists to
+  /// prevent.
+  final String channel;
 
   /// Fingerprint compiled into this build.
   final AbiFingerprint abi;
@@ -155,7 +167,8 @@ final class ManifestRejected extends PatchDecision {
 ///
 /// The rules, in order:
 ///
-/// 1. A manifest for a different app is ignored outright.
+/// 1. A manifest for a different app, or a different channel, is ignored
+///    outright.
 /// 2. A manifest *below* the highest sequence already accepted is stale and
 ///    ignored — signatures never expire, so replay is otherwise free. Equal is
 ///    fine and common: re-reading an unchanged manifest is the normal case, and
@@ -182,6 +195,22 @@ PatchDecision selectPatch(PatchManifest manifest, SelectionContext context) {
     return ManifestRejected(
       'this manifest is for "${manifest.appId}" but this app is '
       '"${context.appId}"; ignoring all of it',
+    );
+  }
+
+  if (manifest.channel != context.channel) {
+    // The same argument as the app id, and a mistake that is easier to make.
+    // Nothing else compares the two: the channel names a directory on disk, the
+    // manifest URL is configured separately, and neither knows about the other.
+    // A `prod` build pointed at a beta URL would install beta patches and file
+    // them under prod, with every layer agreeing.
+    //
+    // Refused rather than rolled back, for the same reason as the app id: a
+    // rollback here would let anyone who can swap a manifest push every device
+    // back onto the store build.
+    return ManifestRejected(
+      'this manifest is for channel "${manifest.channel}" but this build '
+      'follows "${context.channel}"; ignoring all of it',
     );
   }
 

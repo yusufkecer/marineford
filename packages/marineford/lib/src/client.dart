@@ -327,6 +327,7 @@ final class MarinefordClient {
       manifest,
       SelectionContext(
         appId: config.appId,
+        channel: config.channel,
         abi: config.fingerprint,
         appVersion: config.appVersion,
         installId: current.installId,

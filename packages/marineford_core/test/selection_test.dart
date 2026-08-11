@@ -25,12 +25,13 @@ PatchManifest manifest(
   List<PatchEntry> patches, {
   Set<int> revoked = const <int>{},
   String appId = 'com.example.app',
+  String channel = 'prod',
   int sequence = 1,
 }) =>
     PatchManifest(
       schema: 1,
       appId: appId,
-      channel: 'prod',
+      channel: channel,
       sequence: sequence,
       generatedAt: DateTime.utc(2026, 8, 10),
       patches: patches,
@@ -39,6 +40,7 @@ PatchManifest manifest(
 
 SelectionContext ctx({
   String appId = 'com.example.app',
+  String channel = 'prod',
   AbiFingerprint? abi,
   String appVersion = '1.4.0',
   String installId = 'device-1',
@@ -48,6 +50,7 @@ SelectionContext ctx({
 }) =>
     SelectionContext(
       appId: appId,
+      channel: channel,
       abi: abi ?? abiA,
       appVersion: Version.parse(appVersion),
       installId: installId,
@@ -178,6 +181,33 @@ void main() {
           selectPatch(manifest([], appId: 'com.other.app'), ctx(installed: 9));
       expect(d, isA<ManifestRejected>(),
           reason: 'the installed patch must survive a misdirected manifest');
+    });
+  });
+
+  group('channel', () {
+    test('a manifest for another channel is ignored', () {
+      // Nothing else compares these. The client's channel names a directory on
+      // disk; the manifest URL is configured separately and neither knows about
+      // the other. A prod build pointed at a beta URL installed beta patches
+      // and filed them under prod, with every layer agreeing.
+      final d = selectPatch(
+          manifest([entry(7)], channel: 'beta'), ctx(channel: 'prod'));
+      expect(d, isA<ManifestRejected>());
+      expect((d as ManifestRejected).reason, contains('beta'));
+    });
+
+    test('the matching channel is accepted', () {
+      final d = selectPatch(
+          manifest([entry(7)], channel: 'beta'), ctx(channel: 'beta'));
+      expect(d, isA<ApplyPatch>());
+    });
+
+    test('a wrong-channel manifest cannot force a downgrade either', () {
+      // Same reasoning as the app id: a rollback here would let anyone who can
+      // swap a manifest push every device back onto the store build.
+      final d = selectPatch(
+          manifest([], channel: 'beta'), ctx(channel: 'prod', installed: 9));
+      expect(d, isA<ManifestRejected>());
     });
   });
 
