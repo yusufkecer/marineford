@@ -121,24 +121,33 @@ final class Patch {
   }
 
   /// Calls a patched function with no arguments.
-  static Object? invoke0(int offset, [String id = '']) => _run(offset, id);
+  static Object? invoke0(int offset, [String id = '']) {
+    final runtime = _runtime;
+    if (runtime == null) return null;
+    final staged = runtime.args;
+    return _run(runtime, offset, id, staged, staged.length);
+  }
 
   /// Calls a patched function with one argument.
   static Object? invoke1(int offset, Object? a0, [String id = '']) {
     final runtime = _runtime;
     if (runtime == null) return null;
-    runtime.args.add(a0);
-    return _run(offset, id);
+    final staged = runtime.args;
+    final mark = staged.length;
+    staged.add(a0);
+    return _run(runtime, offset, id, staged, mark);
   }
 
   /// Calls a patched function with two arguments.
   static Object? invoke2(int offset, Object? a0, Object? a1, [String id = '']) {
     final runtime = _runtime;
     if (runtime == null) return null;
-    runtime.args
+    final staged = runtime.args;
+    final mark = staged.length;
+    staged
       ..add(a0)
       ..add(a1);
-    return _run(offset, id);
+    return _run(runtime, offset, id, staged, mark);
   }
 
   /// Calls a patched function with three arguments.
@@ -146,11 +155,13 @@ final class Patch {
       [String id = '']) {
     final runtime = _runtime;
     if (runtime == null) return null;
-    runtime.args
+    final staged = runtime.args;
+    final mark = staged.length;
+    staged
       ..add(a0)
       ..add(a1)
       ..add(a2);
-    return _run(offset, id);
+    return _run(runtime, offset, id, staged, mark);
   }
 
   /// Calls a patched function with any number of arguments.
@@ -161,14 +172,20 @@ final class Patch {
   static Object? invokeN(int offset, List<Object?> args, [String id = '']) {
     final runtime = _runtime;
     if (runtime == null) return null;
-    runtime.args.addAll(args);
-    return _run(offset, id);
+    final staged = runtime.args;
+    final mark = staged.length;
+    staged.addAll(args);
+    return _run(runtime, offset, id, staged, mark);
   }
 
-  static Object? _run(int offset, String id) {
-    final runtime = _runtime;
-    if (runtime == null) return null;
-
+  /// Runs the patch at [offset].
+  ///
+  /// [staged] is the list this frame pushed its arguments onto and [mark] is
+  /// where they start, so a failure can take back exactly its own and nothing
+  /// else. See the note in the `finally` for why that cannot be done by
+  /// clearing.
+  static Object? _run(
+      Runtime runtime, int offset, String id, List<Object?> staged, int mark) {
     _depth++;
     try {
       final Object? raw;
@@ -208,10 +225,31 @@ final class Patch {
       // the `== 0` below would never fire again and arguments would accumulate
       // forever.
       if (_depth > 0) _depth--;
-      if (_depth == 0) {
-        // A throw can leave arguments pushed for a frame that never started.
-        // Only safe to clear at the outermost level; an inner frame's failure
-        // must not eat the outer frame's arguments.
+
+      // Leave the argument stack exactly as this frame found it.
+      //
+      // The interpreter takes ownership of the staged list at the callee's
+      // first opcode: it copies the values into the new frame and installs a
+      // *fresh* one (dart_eval 0.8.5, flow.dart — `runtime.args = []`, not
+      // `clear()`). Which list is current on the way out therefore says which
+      // of two different messes we are cleaning up.
+      //
+      // Still ours: the callee never started — a bad offset, or a throw in the
+      // VM's own setup — and our arguments are untouched. Take back exactly
+      // those. Not the whole list: at depth one or more, everything before the
+      // mark belongs to the frame that called us and is still owed to it.
+      //
+      // Not ours: the callee ran and abandoned values it had staged for a call
+      // of its own before it threw. Nothing above us lives on that list, so
+      // clearing it is both safe and necessary — the caller keeps pushing onto
+      // that same list once we unwind, and would find the leftovers first.
+      //
+      // The previous version only cleared at depth 0. That covered both cases
+      // at the outermost level, which is why it looked complete, and neither
+      // one level in.
+      if (identical(runtime.args, staged)) {
+        if (staged.length > mark) staged.removeRange(mark, staged.length);
+      } else {
         runtime.args.clear();
       }
     }

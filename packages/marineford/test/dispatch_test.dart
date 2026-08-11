@@ -307,6 +307,33 @@ int fine(int a) { return a + 1; }
       expect(runtime.args, isEmpty);
     });
 
+    test('a dispatch that never reaches the callee takes its arguments back',
+        () {
+      // The other way a call can fail: not inside the patch, but before it
+      // starts at all. The interpreter installs a fresh argument list at the
+      // callee's first opcode, so an offset that is not a function entry
+      // leaves what we pushed sitting on the caller's list — where the next
+      // thing to read it would take those values as its own parameters.
+      final runtime = compiled('''
+@RuntimeOverride('#add', version: '>=1.0.0')
+int add(int a, int b) { return a + b; }
+''');
+      Patch.activate(runtime, resolveSlots(runtime, Version.parse('1.0.0')),
+          failureThreshold: 99);
+
+      final add = Patch.slot('#add')!;
+      expect(Patch.invoke2(add, 20, 22), 42, reason: 'baseline');
+
+      expect(Patch.invoke2(999999999, 1, 2), isNull,
+          reason: 'a bad offset must degrade, not crash');
+      expect(runtime.args, isEmpty,
+          reason: 'the arguments of a call that never happened must not '
+              'outlive it');
+
+      expect(Patch.invoke2(add, 20, 22), 42,
+          reason: 'a failed dispatch must not poison the next one');
+    });
+
     test('a nested throw still leaves the argument stack clean', () {
       final runtime = compiled('''
 @RuntimeOverride('#outer', version: '>=1.0.0')
