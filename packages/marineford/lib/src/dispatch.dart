@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:dart_eval/dart_eval_bridge.dart';
 import 'package:flutter/foundation.dart';
 import 'package:pub_semver/pub_semver.dart';
@@ -42,6 +44,29 @@ final class Patch {
 
   static int _generation = 0;
   static final ValueNotifier<int> _generationNotifier = ValueNotifier<int>(0);
+
+  /// The zone every patched call runs in.
+  ///
+  /// The catch in [_run] only sees what comes back synchronously, and that is
+  /// not the whole of what a patch can do wrong. Interpreted code can start a
+  /// Future and not await it — its own `async` helper, or a bridge that returns
+  /// one — and when that fails afterwards it lands nowhere: the counter does
+  /// not move, the observer hears nothing, the blocklist never engages, and in
+  /// Flutter it surfaces as an unhandled zone error that can take the app down
+  /// depending on the error handler installed.
+  ///
+  /// So the whole point of the safety net — "a bug in downloaded code degrades
+  /// to the original function running" — held only for synchronous bugs. This
+  /// forked zone catches the rest, which is why dispatch runs inside it.
+  ///
+  /// Reached without a signing key: an ordinary fire-and-forget mistake is
+  /// enough, which makes it the more likely of the two to be met in practice.
+  ///
+  /// Costs 454ns per crossing, against 2.6µs for the crossing itself — see
+  /// `bench/`. Paid only while a patch is live and only on calls that actually
+  /// dispatch, and it buys the difference between an app that degrades and one
+  /// that dies.
+  static Zone? _zone;
 
   /// Bumped every time a patch is activated or deactivated.
   ///
@@ -106,8 +131,27 @@ final class Patch {
     _failureThreshold = failureThreshold;
     _failureCount = 0;
     _depth = 0;
+    // Forked once here rather than per call. A per-call fork could attribute an
+    // async failure to the exact dispatch that started it, but it would pay for
+    // that on every crossing, and the id is a diagnostic — what has to be right
+    // is that the failure is counted at all.
+    _zone = Zone.current.fork(
+      specification: ZoneSpecification(
+        handleUncaughtError: (Zone self, ZoneDelegate parent, Zone zone,
+            Object error, StackTrace stackTrace) {
+          _recordFailure(_asyncId, error, stackTrace);
+        },
+      ),
+    );
     _bump();
   }
+
+  /// Stands in for a dispatch id when the failure arrived asynchronously.
+  ///
+  /// By the time an unawaited Future fails, the call that started it has
+  /// returned, so there is nothing left to name it with. Better an honest
+  /// placeholder than the id of whichever call happened to run most recently.
+  static const String _asyncId = '<async, after the call returned>';
 
   /// Stops dispatching. Every shim goes back to its original body.
   static void deactivate() {
@@ -117,6 +161,7 @@ final class Patch {
     _onFailure = null;
     _failureCount = 0;
     _depth = 0;
+    _zone = null;
     _bump();
   }
 
@@ -188,6 +233,12 @@ final class Patch {
       Runtime runtime, int offset, String id, List<Object?> staged, int mark) {
     _depth++;
     try {
+      // Inside the zone, so that anything the patch starts and does not await
+      // inherits it and reports its failure back here instead of escaping to
+      // the app. Entered once at the outermost frame: a nested call is already
+      // in the zone, and re-entering would cost a closure per crossing for
+      // nothing.
+      final zone = _zone;
       final Object? raw;
       if (_depth > 1) {
         // Re-entry. A patched method that calls another patched method — via a
@@ -198,6 +249,8 @@ final class Patch {
         // the opcode array, with bridgeCall it returns the right answer.
         runtime.bridgeCall(offset);
         raw = runtime.returnValue;
+      } else if (zone != null) {
+        raw = zone.run(() => runtime.execute(offset));
       } else {
         raw = runtime.execute(offset);
       }
@@ -283,6 +336,7 @@ final class Patch {
     _onFailure = null;
     _failureCount = 0;
     _depth = 0;
+    _zone = null;
     _generation = 0;
     _generationNotifier.value = 0;
   }

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
@@ -323,6 +324,20 @@ List<_Result> _interpreterCosts() {
     }
   }
 
+  // What running dispatch inside a forked zone costs. The zone is what catches
+  // a Future the patch started and did not await; without it that failure
+  // escapes the dispatcher entirely. It is only worth having if it disappears
+  // against the crossing it wraps, so the number belongs here rather than in a
+  // comment claiming it does.
+  final guard = Zone.current.fork(
+    specification: ZoneSpecification(
+      handleUncaughtError: (Zone self, ZoneDelegate parent, Zone zone,
+          Object error, StackTrace stackTrace) {},
+    ),
+  );
+  final direct = _timeNs(30000, () => invoke('#trivial', 1));
+  final zoned = _timeNs(30000, () => guard.run(() => invoke('#trivial', 1)));
+
   final trivial = _timeNs(30000, () => invoke('#trivial', 1));
   final loop = _timeNs(2000, () => invoke('#loop', 1));
   final payload =
@@ -339,6 +354,10 @@ List<_Result> _interpreterCosts() {
         budget: 20),
     _Result('cross into the interpreter (fixed)', trivial / 1000, 'us',
         budget: 15),
+    _Result('the same crossing inside the guard zone', zoned / 1000, 'us',
+        budget: 20),
+    _Result('zone guard overhead per crossing', zoned - direct, 'ns',
+        budget: 800),
     _Result('interpreted loop iteration', perIteration, 'ns', budget: 600),
     _Result('realistic JSON normaliser call', parse / 1000, 'us', budget: 25),
   ];

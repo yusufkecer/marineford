@@ -352,6 +352,108 @@ int inner(int a) { return a ~/ 0; }
     });
   });
 
+  group('a failure that arrives after the call returned', () {
+    test('is counted rather than escaping to the app', () async {
+      // The catch in _run only ever saw what came back synchronously. A patch
+      // that starts a Future and does not await it — its own async helper, or
+      // a bridge that hands one back — fails somewhere else entirely: the
+      // counter never moved, the observer heard nothing, the blocklist never
+      // engaged, and in Flutter it surfaced as an unhandled zone error that
+      // could take the app down depending on the handler installed.
+      //
+      // Nothing about this needs a signing key. It is an ordinary mistake, and
+      // the safety story says an ordinary mistake degrades to "the original
+      // function runs".
+      final runtime = compiled('''
+@RuntimeOverride('#fire', version: '>=1.0.0')
+int fire(int a) {
+  boom();
+  return a + 1;
+}
+
+Future<void> boom() async {
+  await Future.delayed(Duration(milliseconds: 1));
+  throw 'this used to escape';
+}
+''');
+      final failures = <Object>[];
+      Patch.activate(
+        runtime,
+        resolveSlots(runtime, Version.parse('1.0.0')),
+        failureThreshold: 99,
+        onFailure: (_, error, __) => failures.add(error),
+      );
+
+      // The call itself succeeds — the throw has not happened yet.
+      expect(Patch.invoke1(Patch.slot('#fire')!, 1, '#fire'), 2);
+      expect(failures, isEmpty, reason: 'nothing has gone wrong yet');
+
+      await Future<void>.delayed(const Duration(milliseconds: 30));
+
+      expect(failures, hasLength(1),
+          reason: 'the failure has to reach the dispatcher, late or not');
+      expect(failures.single.toString(), contains('this used to escape'));
+      expect(Patch.failureCount, 1);
+    });
+
+    test('counts toward the threshold like any other failure', () async {
+      final runtime = compiled('''
+@RuntimeOverride('#fire', version: '>=1.0.0')
+int fire(int a) {
+  boom();
+  return a + 1;
+}
+
+Future<void> boom() async {
+  await Future.delayed(Duration(milliseconds: 1));
+  throw 'again';
+}
+''');
+      Patch.activate(runtime, resolveSlots(runtime, Version.parse('1.0.0')),
+          failureThreshold: 2);
+
+      final slot = Patch.slot('#fire')!;
+      Patch.invoke1(slot, 1, '#fire');
+      Patch.invoke1(slot, 1, '#fire');
+      expect(Patch.isActive, isTrue, reason: 'neither has failed yet');
+
+      await Future<void>.delayed(const Duration(milliseconds: 30));
+      expect(Patch.isActive, isFalse,
+          reason: 'a patch that keeps failing asynchronously must be dropped '
+              'like one that keeps failing synchronously');
+    });
+
+    test('a synchronous throw before any await still arrives synchronously',
+        () {
+      // dart_eval runs an async body eagerly until its first suspension point,
+      // so this one never becomes asynchronous at all. Worth pinning: it is the
+      // reason the zone is a second net rather than a replacement for the
+      // catch, and someone reading only the zone might remove the catch.
+      final runtime = compiled('''
+@RuntimeOverride('#fire', version: '>=1.0.0')
+int fire(int a) {
+  boom();
+  return a + 1;
+}
+
+Future<void> boom() async {
+  throw 'immediate';
+}
+''');
+      final failures = <Object>[];
+      Patch.activate(
+        runtime,
+        resolveSlots(runtime, Version.parse('1.0.0')),
+        failureThreshold: 99,
+        onFailure: (_, error, __) => failures.add(error),
+      );
+
+      expect(Patch.invoke1(Patch.slot('#fire')!, 1, '#fire'), isNull,
+          reason: 'caught on the way out, so the shim falls back');
+      expect(failures.single.toString(), contains('immediate'));
+    });
+  });
+
   test('a throwing failure handler does not escape', () {
     final runtime = compiled('''
 @RuntimeOverride('#boom', version: '>=1.0.0')
