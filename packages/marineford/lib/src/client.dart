@@ -279,9 +279,9 @@ final class MarinefordClient {
           'manifest fetch returned HTTP ${response.statusCode}');
     }
 
-    // The manifest and its signature are one file. Parsing is structural only;
-    // nothing here is trusted until the signature over the exact signed bytes
-    // checks out.
+    // The manifest and its signature are one file. Reading the envelope does
+    // not touch what is inside it, so no field validation, and not even a JSON
+    // decode, runs on bytes the signature has not vouched for.
     final signed = SignedManifest.parse(response.body);
     if (!await _verifier.verify(signed.signedBytes, signed.signature)) {
       _emit(const PatchRejectedEvent(
@@ -291,7 +291,7 @@ final class MarinefordClient {
       return const StayOnCurrent();
     }
 
-    final manifest = signed.manifest;
+    final manifest = signed.open();
     _emit(ManifestLoaded(manifest));
 
     final decision = selectPatch(

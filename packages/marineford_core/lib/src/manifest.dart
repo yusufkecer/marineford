@@ -325,15 +325,10 @@ final class PatchManifest {
 /// by hand; `marineford show` prints it.
 @immutable
 final class SignedManifest {
-  /// Creates a [SignedManifest].
-  const SignedManifest({
-    required this.manifest,
+  const SignedManifest._({
     required this.signedBytes,
     required this.signature,
   });
-
-  /// The manifest itself.
-  final PatchManifest manifest;
 
   /// The exact bytes the signature covers.
   final Uint8List signedBytes;
@@ -360,13 +355,19 @@ final class SignedManifest {
         }),
       ));
 
-  /// Parses an envelope without checking the signature.
+  /// Reads the envelope, and nothing inside it.
   ///
-  /// Structural only. The caller must verify [signature] over [signedBytes]
-  /// before trusting [manifest] — which is why the manifest is parsed from the
-  /// same bytes the signature covers and not from anything else in the file.
-  factory SignedManifest.parse(Uint8List bytes,
-      {int maxSchema = kMaxManifestSchema}) {
+  /// Genuinely structural: it decodes the outer object, pulls out the signature
+  /// and the bytes it covers, and stops. The manifest inside stays an opaque
+  /// string until [open] is called.
+  ///
+  /// The split is the whole point. Verification has to happen before the
+  /// attacker-controlled payload is parsed, and the only reliable way to
+  /// guarantee that is to make the parse a separate step the caller cannot
+  /// reach by accident. An earlier version parsed the manifest here and
+  /// described itself as structural; it ran every field validation, and every
+  /// JSON decode, on bytes nobody had vouched for.
+  factory SignedManifest.parse(Uint8List bytes) {
     final Object? decoded;
     try {
       decoded = jsonDecode(utf8.decode(bytes));
@@ -390,12 +391,24 @@ final class SignedManifest {
           'manifest "signature" is not valid base64');
     }
 
-    final signedText = _string(decoded, 'manifest');
-    final signedBytes = Uint8List.fromList(utf8.encode(signedText));
+    return SignedManifest._(
+      signedBytes:
+          Uint8List.fromList(utf8.encode(_string(decoded, 'manifest'))),
+      signature: signature,
+    );
+  }
 
+  /// Parses the manifest this envelope carries.
+  ///
+  /// Call this only after [signature] has been verified over [signedBytes].
+  /// Everything it does — decoding JSON, validating fields, parsing version
+  /// constraints — is work performed on whatever the server sent, so doing it
+  /// first would put the parser in front of the signature rather than behind
+  /// it.
+  PatchManifest open({int maxSchema = kMaxManifestSchema}) {
     final Object? inner;
     try {
-      inner = jsonDecode(signedText);
+      inner = jsonDecode(utf8.decode(signedBytes));
     } on FormatException catch (e) {
       throw ManifestFormatException(
           'the signed manifest is not valid JSON: ${e.message}');
@@ -404,12 +417,7 @@ final class SignedManifest {
       throw const ManifestFormatException(
           'the signed manifest must be a JSON object');
     }
-
-    return SignedManifest(
-      manifest: PatchManifest.fromJson(inner, maxSchema: maxSchema),
-      signedBytes: signedBytes,
-      signature: signature,
-    );
+    return PatchManifest.fromJson(inner, maxSchema: maxSchema);
   }
 }
 

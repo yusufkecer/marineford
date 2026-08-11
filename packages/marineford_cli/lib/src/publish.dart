@@ -97,7 +97,7 @@ final class ChannelPublisher {
         patches: const <PatchEntry>[],
       );
     }
-    final manifest = SignedManifest.parse(bytes).manifest;
+    final manifest = SignedManifest.parse(bytes).open();
     if (manifest.appId != project.appId) {
       throw CliException(
         'the manifest at ${target.describe(manifestFile)} belongs to '
@@ -120,8 +120,9 @@ final class ChannelPublisher {
     final signature = await signer.sign(signedBytes);
     final envelope = SignedManifest.encode(signedBytes, signature);
 
-    // Read it back the way a device would, including the signature check. If
-    // this fails, the channel was about to break for everyone.
+    // Read it back the way a device would, in the same order: envelope,
+    // signature, then the manifest. If this fails, the channel was about to
+    // break for everyone.
     final parsed = SignedManifest.parse(envelope);
     final verifier = PatchVerifier(signer.publicKey);
     if (!await verifier.verify(parsed.signedBytes, parsed.signature)) {
@@ -131,6 +132,8 @@ final class ChannelPublisher {
             'written.',
       );
     }
+
+    parsed.open();
 
     await target.put(manifestFile, envelope);
   }

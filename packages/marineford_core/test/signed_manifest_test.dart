@@ -42,11 +42,12 @@ void main() {
     test('a published envelope parses back to the same manifest', () async {
       final source = manifest();
       final parsed = SignedManifest.parse(await publish(signer, source));
+      final reopened = parsed.open();
 
-      expect(parsed.manifest.appId, source.appId);
-      expect(parsed.manifest.sequence, source.sequence);
-      expect(parsed.manifest.patches.single, source.patches.single);
-      expect(parsed.manifest.revoked, source.revoked);
+      expect(reopened.appId, source.appId);
+      expect(reopened.sequence, source.sequence);
+      expect(reopened.patches.single, source.patches.single);
+      expect(reopened.revoked, source.revoked);
       expect(
           await verifier.verify(parsed.signedBytes, parsed.signature), isTrue);
     });
@@ -94,8 +95,8 @@ void main() {
       })));
 
       final parsed = SignedManifest.parse(bytes);
-      expect(parsed.manifest.sequence, 2,
-          reason: 'parsing is not a trust '
+      expect(parsed.open().sequence, 2,
+          reason: 'opening is not a trust '
               'boundary; it happily reads the edited value');
       expect(
           await verifier.verify(parsed.signedBytes, parsed.signature), isFalse,
@@ -149,17 +150,6 @@ void main() {
       'signature': 'not base64!!',
       'manifest': '{}',
     });
-    rejects('inner payload is not JSON', <String, Object?>{
-      'envelope': 1,
-      'signature': base64Encode(Uint8List(64)),
-      'manifest': 'nonsense',
-    });
-    rejects('inner payload is not an object', <String, Object?>{
-      'envelope': 1,
-      'signature': base64Encode(Uint8List(64)),
-      'manifest': '[1,2,3]',
-    });
-
     test('a newer envelope version is refused as unsupported', () {
       expect(
         () => SignedManifest.parse(
@@ -178,6 +168,58 @@ void main() {
             Uint8List.fromList(utf8.encode('<html>504</html>'))),
         throwsA(isA<ManifestFormatException>()),
       );
+    });
+  });
+
+  group('nothing inside the envelope is read until open()', () {
+    // The ordering these tests pin down is the reason `parse` and `open` are
+    // two calls. If parsing the envelope also parsed the manifest, every field
+    // validation — and the JSON decoder itself — would run on bytes nobody had
+    // checked the signature of yet. A well-formed envelope carrying garbage has
+    // to survive `parse` and die on `open`, not the other way around.
+    Uint8List envelope(String inner) =>
+        Uint8List.fromList(utf8.encode(jsonEncode(<String, Object?>{
+          'envelope': 1,
+          'signature': base64Encode(Uint8List(64)),
+          'manifest': inner,
+        })));
+
+    void deferred(String label, String inner) {
+      test(label, () {
+        final parsed = SignedManifest.parse(envelope(inner));
+        expect(parsed.signature, hasLength(64));
+        expect(utf8.decode(parsed.signedBytes), inner);
+        expect(parsed.open, throwsA(isA<MarinefordFormatException>()));
+      });
+    }
+
+    deferred('inner payload is not JSON', 'nonsense');
+    deferred('inner payload is not an object', '[1,2,3]');
+    deferred('inner payload is missing every field', '{}');
+    deferred(
+        'inner payload has a bad version constraint',
+        jsonEncode(<String, Object?>{
+          ...manifest().toJson(),
+          'patches': <Object?>[
+            <String, Object?>{
+              ...manifest().patches.single.toJson(),
+              'runtime': 'not a constraint',
+            },
+          ],
+        }));
+    deferred('inner payload claims a newer schema',
+        jsonEncode(<String, Object?>{...manifest().toJson(), 'schema': 99}));
+
+    test('a manifest that fails verification is never opened', () async {
+      final impostor = await PatchSigner.generate();
+      final parsed = SignedManifest.parse(await publish(impostor, manifest()));
+
+      // The client's order: check the signature, and only then read what it
+      // covered. Here the check fails, so `open` is simply never reached —
+      // which is the whole defence, since `open` is where an attacker's JSON
+      // would otherwise get to run the parser.
+      expect(
+          await verifier.verify(parsed.signedBytes, parsed.signature), isFalse);
     });
   });
 }

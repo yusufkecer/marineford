@@ -264,7 +264,7 @@ int normalize(int v) {
       final dist = Directory(p.join(root.path, 'dist', 'prod'));
       final manifestBytes =
           File(p.join(dist.path, 'manifest.json')).readAsBytesSync();
-      final manifest = SignedManifest.parse(manifestBytes).manifest;
+      final manifest = SignedManifest.parse(manifestBytes).open();
 
       expect(manifest.appId, 'com.example.app');
       expect(manifest.patches.single.number, 1);
@@ -299,7 +299,7 @@ int normalize(int v) {
       final dist = p.join(root.path, 'dist', 'prod');
       final manifest = SignedManifest.parse(
               File(p.join(dist, 'manifest.json')).readAsBytesSync())
-          .manifest;
+          .open();
       final bytes = File(p.join(dist, '1.mfp')).readAsBytesSync();
 
       expect(manifest.patches.single.sha256, sha256Hex(bytes));
@@ -319,7 +319,7 @@ int normalize(int v) {
       final manifest = SignedManifest.parse(
               File(p.join(root.path, 'dist', 'prod', 'manifest.json'))
                   .readAsBytesSync())
-          .manifest;
+          .open();
       expect(manifest.patches.map((e) => e.number), [3, 2, 1]);
     });
 
@@ -390,7 +390,7 @@ int normalize(int v) {
       final manifest = SignedManifest.parse(
               File(p.join(root.path, 'dist', 'prod', 'manifest.json'))
                   .readAsBytesSync())
-          .manifest;
+          .open();
       expect(manifest.patches.single.rollout, 1.0);
     });
 
@@ -429,7 +429,7 @@ int normalize(int v) {
       final dist = p.join(root.path, 'dist', 'prod');
       final manifest = SignedManifest.parse(
               File(p.join(dist, 'manifest.json')).readAsBytesSync())
-          .manifest;
+          .open();
       expect(manifest.revoked, {1});
       expect(File(p.join(dist, '1.mfp')).existsSync(), isTrue,
           reason: 'the file stays available for forensics');
@@ -454,7 +454,7 @@ int normalize(int v) {
       final manifest = SignedManifest.parse(
               File(p.join(root.path, 'dist', 'prod', 'manifest.json'))
                   .readAsBytesSync())
-          .manifest;
+          .open();
       expect(manifest.patches.map((e) => e.number), contains(2));
       expect(manifest.revoked, {1});
     });
