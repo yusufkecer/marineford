@@ -25,7 +25,6 @@ dependencies:
   args: ^2.6.0
   crypto: ^3.0.6
   dart_eval: ^0.8.5
-  http: ^1.2.0
   marineford_core: ^0.1.0-dev
   path: ^1.9.0
   pub_semver: ^2.1.5
