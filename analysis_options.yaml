@@ -15,7 +15,7 @@ analyzer:
     unawaited_futures: error
   exclude:
     - "**/*.g.dart"
-    - "**/*.denden.dart"
+    - "**/*.marineford.dart"
     - "**/*.eval.dart"
 
 linter:

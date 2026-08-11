@@ -50,7 +50,7 @@ dart run marineford_cli:marineford build
 ```
 
 ```bash
-dart run marineford_cli:marineford publish --to dist --min-app-version 1.4.0 --max-app-version 1.4.99
+dart run marineford_cli:marineford publish --to dist --app-versions '>=1.4.0 <1.5.0'
 ```
 
 ## The signing key

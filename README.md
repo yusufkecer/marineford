@@ -37,8 +37,7 @@ workable, and understanding them is most of understanding the library:
    calls — it simply stops calling them. You never have to predict which leaf
    will break, only which entry point sits above it.
 
-2. **Marking is close to free.** A marked call with no patch active measures
-   **3.9 ns** against **2.3 ns** unmarked. Mark whole categories, not
+2. **Marking is close to free.** A marked call with no patch active measures **~4 ns** against **~2 ns** unmarked. Mark whole categories, not
    individual suspects.
 
 3. **One chokepoint covers an enormous amount.** A single marked normaliser on
@@ -58,7 +57,7 @@ compiler to do it. See [Compared with Shorebird](#compared-with-shorebird).
   YOUR APP                    YOUR CI                    ANY STATIC HOST
   ────────                    ───────                    ───────────────
   @patchable                  marineford build           manifest.json
-       │                            │                    manifest.json.sig
+       │                            │                    (self-signed)
   build_runner                 dart_eval                 7.mfp
        │                       + gzip                          │
        ▼                       + Ed25519                       │
@@ -247,10 +246,10 @@ marineford build
 ```
 
 ```bash
-marineford publish --to dist --min-app-version 1.4.0 --max-app-version 1.4.99 --percent 10
+marineford publish --to dist --app-versions '>=1.4.0 <1.5.0' --percent 10
 ```
 
-That writes `dist/prod/` — `manifest.json`, `manifest.json.sig`, and `1.mfp`.
+That writes `dist/prod/` — `manifest.json` (which carries its own signature) and `1.mfp`.
 Upload that directory anywhere static: S3, R2, Cloudflare Pages, a folder behind
 nginx. There is no server to run.
 
@@ -331,7 +330,7 @@ per-call cost is an integer compare rather than a map lookup.
 
 ### Where **not** to mark
 
-Crossing into the interpreter costs about **2.7 µs**. That is nothing for a
+Crossing into the interpreter costs about **2.6 µs**. That is nothing for a
 screen's worth of logic and ruinous per list item or per frame. `marineford
 build` warns when a patch looks like it will be expensive, but the marking
 decision is yours.
@@ -428,7 +427,7 @@ size_budget_kb: 256    # warn above this
 In CI, supply the key through the environment instead of a file:
 
 ```bash
-MARINEFORD_SIGNING_KEY="$SIGNING_KEY" marineford publish --min-app-version 1.4.0 --max-app-version 1.4.99
+MARINEFORD_SIGNING_KEY="$SIGNING_KEY" marineford publish --app-versions '>=1.4.0 <1.5.0'
 ```
 
 Channels are just directories. `--channel beta` publishes to `dist/beta/`, and
@@ -516,10 +515,10 @@ dart compile exe bench/bin/run.dart -o bench/run && ./bench/run
 
 | | |
 |---|---|
-| Marked call, no patch active | **3.9 ns** (unmarked: 2.3 ns) |
-| Crossing into the interpreter | **~2.7 µs** fixed |
+| Marked call, no patch active | **~4 ns** (unmarked: ~2 ns) |
+| Crossing into the interpreter | **~2.6 µs** fixed |
 | Interpreted loop iteration | **~110 ns** |
-| Realistic JSON normaliser call | **~3.6 µs** |
+| Realistic JSON normaliser call | **~3.4 µs** |
 | Activating a patch at startup | **~1 ms** |
 | A small patch on the wire | **~3.5 KB** gzipped |
 

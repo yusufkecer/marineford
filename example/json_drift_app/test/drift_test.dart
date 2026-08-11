@@ -102,8 +102,7 @@ void main() {
         project,
         target: DirectoryTarget(dist),
         channel: 'prod',
-        appVersionMin: Version.parse('1.4.0'),
-        appVersionMax: Version.parse('1.4.99'),
+        appVersions: VersionConstraint.parse('>=1.4.0 <=1.4.99'),
       );
     });
 
