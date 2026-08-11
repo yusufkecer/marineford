@@ -3,7 +3,8 @@ import 'dart:typed_data';
 import 'package:marineford_core/marineford_core.dart';
 import 'package:test/test.dart';
 
-Uint8List abiHash([int fill = 0xab]) => Uint8List(32)..fillRange(0, 32, fill);
+AbiFingerprint abi([int fill = 0xab]) =>
+    AbiFingerprint.fromBytes(Uint8List(32)..fillRange(0, 32, fill));
 
 /// Builds a complete, structurally valid container. The signature is garbage —
 /// these tests are about framing, not crypto.
@@ -14,7 +15,7 @@ Uint8List build({
 }) {
   final region = MfpContainer.buildSignedRegion(
     payload: payload ?? Uint8List.fromList([1, 2, 3, 4, 5]),
-    abiHash: abiHash(),
+    abi: abi(),
     flags: flags,
     schema: schema,
   );
@@ -29,8 +30,8 @@ void main() {
       expect(c.schema, 1);
       expect(c.flags.has(MfpFlags.gzip), isTrue);
       expect(c.payload, payload);
-      expect(c.abiHash, abiHash());
-      expect(c.abi, 'sha256:${'ab' * 32}');
+      expect(c.abi, abi());
+      expect(c.abi.toString(), 'sha256:${'ab' * 32}');
       expect(c.signature.length, kMfpSignatureLength);
     });
 
@@ -46,11 +47,18 @@ void main() {
       expect(c.signedRegion, bytes.sublist(0, bytes.length - 64));
     });
 
-    test('buildSignedRegion rejects a wrong-sized ABI hash', () {
+    test('the magic really spells MFP1', () {
+      // It spelled MFP1 for a while: a project rename updated every mention of
+      // the old magic in prose and left the bytes alone.
+      final bytes = build();
+      expect(String.fromCharCodes(bytes.sublist(0, 4)), 'MFP1');
+    });
+
+    test('a container over the ceiling is refused before anything else', () {
       expect(
-        () => MfpContainer.buildSignedRegion(
-            payload: Uint8List(4), abiHash: Uint8List(16)),
-        throwsA(isA<ArgumentError>()),
+        () => MfpContainer.parse(Uint8List(kMfpMaxLength + 1)),
+        throwsA(isA<MfpFormatException>()
+            .having((e) => e.message, 'message', contains('ceiling'))),
       );
     });
   });

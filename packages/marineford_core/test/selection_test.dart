@@ -2,12 +2,12 @@ import 'package:marineford_core/marineford_core.dart';
 import 'package:pub_semver/pub_semver.dart';
 import 'package:test/test.dart';
 
-final abiA = 'sha256:${'a' * 64}';
-final abiB = 'sha256:${'b' * 64}';
+final abiA = AbiFingerprint.parse("sha256:${"a" * 64}");
+final abiB = AbiFingerprint.parse("sha256:${"b" * 64}");
 
 PatchEntry entry(
   int number, {
-  String? abi,
+  AbiFingerprint? abi,
   String runtime = '>=1.0.0 <2.0.0',
   double rollout = 1.0,
 }) =>
@@ -25,11 +25,13 @@ PatchManifest manifest(
   List<PatchEntry> patches, {
   Set<int> revoked = const <int>{},
   String appId = 'com.example.app',
+  int sequence = 1,
 }) =>
     PatchManifest(
       schema: 1,
       appId: appId,
       channel: 'prod',
+      sequence: sequence,
       generatedAt: DateTime.utc(2026, 8, 10),
       patches: patches,
       revoked: revoked,
@@ -37,11 +39,12 @@ PatchManifest manifest(
 
 SelectionContext ctx({
   String appId = 'com.example.app',
-  String? abi,
+  AbiFingerprint? abi,
   String appVersion = '1.4.0',
   String installId = 'device-1',
   int installed = 0,
   Set<int> blocklist = const <int>{},
+  int lastSequence = 0,
 }) =>
     SelectionContext(
       appId: appId,
@@ -50,6 +53,7 @@ SelectionContext ctx({
       installId: installId,
       installedPatch: installed,
       blocklist: blocklist,
+      lastSequence: lastSequence,
     );
 
 void main() {
@@ -232,6 +236,8 @@ void main() {
     });
   });
 
+  _gaps();
+
   test('rejections are reported for every skipped patch', () {
     final d = selectPatch(
       manifest([
@@ -243,5 +249,120 @@ void main() {
     );
     expect(d, isA<StayOnCurrent>());
     expect(d.rejections.map((r) => r.number), [9, 8, 7]);
+  });
+}
+
+/// The gaps the review named, each pinned to the defect it covers.
+void _gaps() {
+  group('stale manifests', () {
+    test('the same sequence is not treated as an attack', () {
+      // Re-reading an unchanged manifest is the normal case, not a replay.
+      // The decision still stands; nothing about it is suspicious.
+      final d =
+          selectPatch(manifest([entry(7)], sequence: 5), ctx(lastSequence: 5));
+      expect(d, isA<ApplyPatch>());
+      expect(d.rejections, isEmpty);
+    });
+
+    test('a manifest below the accepted sequence is ignored', () {
+      final d =
+          selectPatch(manifest([entry(7)], sequence: 3), ctx(lastSequence: 5));
+      expect(d, isA<StayOnCurrent>());
+    });
+
+    test('replaying a pre-revocation manifest cannot un-revoke a patch', () {
+      // The attack the sequence exists for. Signatures never expire, so an
+      // attacker holding the manifest published just before a revocation could
+      // otherwise serve it forever and the kill switch would never arrive.
+      final beforeRevocation = manifest([entry(7)], sequence: 4);
+      final d =
+          selectPatch(beforeRevocation, ctx(installed: 7, lastSequence: 5));
+      expect(d, isA<StayOnCurrent>());
+      expect(d.rejections.single.reason, contains('replay'));
+    });
+
+    test('a newer sequence is accepted', () {
+      final d =
+          selectPatch(manifest([entry(7)], sequence: 6), ctx(lastSequence: 5));
+      expect(d, isA<ApplyPatch>());
+    });
+
+    test('the manifest rejection is not attributed to a patch number', () {
+      final d = selectPatch(manifest([], sequence: 1), ctx(lastSequence: 9));
+      expect(d.rejections.single.number, isNull);
+    });
+  });
+
+  group('revoked and blocklisted together', () {
+    test('a patch both revoked and blocklisted is rejected once', () {
+      final d =
+          selectPatch(manifest([entry(7)], revoked: {7}), ctx(blocklist: {7}));
+      expect(d, isA<StayOnCurrent>());
+      expect(d.rejections, hasLength(1));
+    });
+
+    test('the installed patch being both still rolls back', () {
+      final d = selectPatch(manifest([entry(7)], revoked: {7}),
+          ctx(installed: 7, blocklist: {7}));
+      expect(d, isA<RollBackToBase>());
+      // Revocation is the publisher's verdict and the more useful one to
+      // report when both apply.
+      expect((d as RollBackToBase).reason, contains('revoked'));
+    });
+  });
+
+  group('empty manifests', () {
+    test('an empty manifest with the installed patch revoked rolls back', () {
+      final d = selectPatch(manifest([], revoked: {7}), ctx(installed: 7));
+      expect(d, isA<RollBackToBase>());
+    });
+
+    test('an empty manifest with nothing installed does nothing', () {
+      expect(selectPatch(manifest([]), ctx()), isA<StayOnCurrent>());
+    });
+
+    test('an empty manifest does not disturb a healthy installed patch', () {
+      expect(
+          selectPatch(manifest([]), ctx(installed: 7)), isA<StayOnCurrent>());
+    });
+  });
+
+  group('rollout boundaries', () {
+    test('a NaN rollout is refused at parse time, never reaching selection',
+        () {
+      expect(
+        () => PatchEntry.fromJson(<String, Object?>{
+          'number': 1,
+          'url': 'a.mfp',
+          'size': 10,
+          'sha256': 'c' * 64,
+          'abi': abiA.toString(),
+          'runtime': '>=1.0.0',
+          'rollout': double.nan,
+        }),
+        throwsA(isA<ManifestFormatException>()),
+      );
+    });
+
+    test('exactly 0 and exactly 1 behave as the extremes', () {
+      for (var i = 0; i < 30; i++) {
+        final c = ctx(installId: 'device-$i');
+        expect(selectPatch(manifest([entry(7, rollout: 0.0)]), c),
+            isA<StayOnCurrent>());
+        expect(selectPatch(manifest([entry(7, rollout: 1.0)]), c),
+            isA<ApplyPatch>());
+      }
+    });
+
+    test('a bucket exactly on the boundary is excluded, not included', () {
+      // isInRollout is `bucket < fraction * buckets`, so a device whose bucket
+      // equals the cutoff must be out. Off by one here silently shifts every
+      // rollout percentage by one ten-thousandth of the population.
+      const id = 'boundary-probe';
+      final bucket = rolloutBucket(id, 1);
+      final exact = bucket / kRolloutBuckets;
+      expect(isInRollout(id, 1, exact), isFalse);
+      expect(isInRollout(id, 1, (bucket + 1) / kRolloutBuckets), isTrue);
+    });
   });
 }

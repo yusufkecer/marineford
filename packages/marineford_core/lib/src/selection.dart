@@ -1,6 +1,7 @@
 import 'package:meta/meta.dart';
 import 'package:pub_semver/pub_semver.dart';
 
+import 'abi.dart';
 import 'manifest.dart';
 import 'rollout.dart';
 
@@ -15,13 +16,14 @@ final class SelectionContext {
     required this.installId,
     this.installedPatch = 0,
     this.blocklist = const <int>{},
+    this.lastSequence = 0,
   });
 
   /// Application id this build expects the manifest to be for.
   final String appId;
 
-  /// ABI fingerprint compiled into this build, as `sha256:<hex>`.
-  final String abi;
+  /// Fingerprint compiled into this build.
+  final AbiFingerprint abi;
 
   /// Version of the app as shipped by the store.
   final Version appVersion;
@@ -29,7 +31,9 @@ final class SelectionContext {
   /// Stable per-install identifier used for rollout bucketing.
   ///
   /// It only has to be stable and unique-ish; it is never sent anywhere, since
-  /// there is no server. A random id generated on first launch is ideal.
+  /// there is no server. It must genuinely persist, though — a device that
+  /// invents a new one each launch redraws its rollout bucket each launch, and
+  /// staged rollout stops meaning anything.
   final String installId;
 
   /// Patch currently installed, or `0` for none.
@@ -40,23 +44,35 @@ final class SelectionContext {
   /// Populated by the crash-loop guard. Local, so one device's bad experience
   /// does not need a publisher round trip to take effect.
   final Set<int> blocklist;
+
+  /// Highest manifest sequence this device has accepted.
+  ///
+  /// Anything at or below this is stale and ignored. Without it, an attacker
+  /// who controls the CDN can keep serving the last manifest published before a
+  /// revocation, and the kill switch silently never arrives.
+  final int lastSequence;
 }
 
 /// Why a patch was passed over. Carried on every decision so that
 /// `marineford doctor` and observers can explain "nothing happened".
 @immutable
 final class PatchRejection {
-  /// Creates a [PatchRejection].
-  const PatchRejection(this.number, this.reason);
+  /// Creates a [PatchRejection] about a specific patch.
+  const PatchRejection(int this.number, this.reason);
 
-  /// The patch number that was skipped.
-  final int number;
+  /// Creates a [PatchRejection] about the manifest as a whole.
+  const PatchRejection.manifest(this.reason) : number = null;
+
+  /// The patch number that was skipped, or null when the rejection is about the
+  /// manifest rather than any one patch.
+  final int? number;
 
   /// Why, in words.
   final String reason;
 
   @override
-  String toString() => '#$number: $reason';
+  String toString() =>
+      number == null ? 'manifest: $reason' : '#$number: $reason';
 }
 
 /// What the client should do about the manifest it just read.
@@ -112,65 +128,73 @@ final class StayOnCurrent extends PatchDecision {
 /// The rules, in order:
 ///
 /// 1. A manifest for a different app is ignored outright.
-/// 2. A patch must match the ABI fingerprint compiled into this build.
-///    Semver alone does not catch a renamed method; the fingerprint does.
-/// 3. A patch must satisfy its own `runtime` constraint against [
-///    SelectionContext.appVersion].
-/// 4. Revoked and locally blocklisted patches are never eligible.
-/// 5. The device must fall inside the patch's staged rollout.
-/// 6. Among what is left, the highest number wins.
-/// 7. That number must be greater than what is installed — unless the installed
+/// 2. A manifest at or below the highest sequence already accepted is stale and
+///    ignored — signatures never expire, so replay is otherwise free.
+/// 3. A patch must match the fingerprint compiled into this build. Semver alone
+///    does not catch a renamed method; the fingerprint does.
+/// 4. A patch must satisfy its own `runtime` constraint.
+/// 5. Revoked and locally blocklisted patches are never eligible.
+/// 6. The device must fall inside the patch's staged rollout.
+/// 7. Among what is left, the highest number wins.
+/// 8. That number must be greater than what is installed — unless the installed
 ///    patch is itself revoked or blocklisted, which is the one case where
 ///    moving backwards is correct.
 ///
-/// Rule 7 is the anti-rollback rule. Without it, an attacker who controls the
+/// Rule 8 is the anti-rollback rule. Without it, an attacker who controls the
 /// CDN could serve an old, validly signed, known-broken patch forever.
 PatchDecision selectPatch(PatchManifest manifest, SelectionContext context) {
-  final rejections = <PatchRejection>[];
-
   if (manifest.appId != context.appId) {
     // Deliberately *not* a rollback. Reading the wrong manifest means a
     // misconfigured CDN path or a signing key shared across apps — neither is
     // an attack that discarding the installed patch would mitigate, and
     // treating it as one hands anyone who can swap manifests a way to force
     // every device back onto the buggy store build. Do nothing, loudly.
-    return StayOnCurrent(rejections: [
-      PatchRejection(
-        0,
-        'manifest is for "${manifest.appId}" but this app is '
-        '"${context.appId}"; ignoring the whole manifest',
+    return StayOnCurrent(rejections: <PatchRejection>[
+      PatchRejection.manifest(
+        'this manifest is for "${manifest.appId}" but this app is '
+        '"${context.appId}"; ignoring all of it',
       ),
     ]);
   }
 
+  if (manifest.sequence < context.lastSequence) {
+    // Strictly older, which a publisher never produces: the sequence only goes
+    // up. Someone is serving a manifest from before something changed — most
+    // usefully, from before a revocation.
+    return StayOnCurrent(rejections: <PatchRejection>[
+      PatchRejection.manifest(
+        'sequence ${manifest.sequence} is older than the last accepted '
+        '${context.lastSequence}; this manifest is stale and may be a replay',
+      ),
+    ]);
+  }
+
+  final rejections = <PatchRejection>[];
   final installedIsDead = context.installedPatch > 0 &&
       (manifest.revoked.contains(context.installedPatch) ||
           context.blocklist.contains(context.installedPatch));
 
-  final eligible = <PatchEntry>[];
+  PatchEntry? best;
   for (final entry in manifest.patches) {
     final reason = _rejectionReason(entry, manifest, context);
     if (reason != null) {
       rejections.add(PatchRejection(entry.number, reason));
-    } else {
-      eligible.add(entry);
+    } else if (best == null || entry.number > best.number) {
+      best = entry;
     }
-  }
-
-  PatchEntry? best;
-  for (final entry in eligible) {
-    if (best == null || entry.number > best.number) best = entry;
   }
 
   if (installedIsDead) {
-    final reason = manifest.revoked.contains(context.installedPatch)
-        ? 'patch #${context.installedPatch} was revoked by the publisher'
-        : 'patch #${context.installedPatch} is locally blocklisted after '
-            'repeated failures';
-    if (best != null && best.number != context.installedPatch) {
-      return ApplyPatch(best, rejections: rejections);
-    }
-    return RollBackToBase(reason, rejections: rejections);
+    // `best` cannot be the installed patch here: a revoked or blocklisted
+    // patch is never eligible, so it was filtered out above.
+    if (best != null) return ApplyPatch(best, rejections: rejections);
+    return RollBackToBase(
+      manifest.revoked.contains(context.installedPatch)
+          ? 'patch #${context.installedPatch} was revoked by the publisher'
+          : 'patch #${context.installedPatch} is locally blocklisted after '
+              'repeated failures',
+      rejections: rejections,
+    );
   }
 
   if (best != null && best.number > context.installedPatch) {

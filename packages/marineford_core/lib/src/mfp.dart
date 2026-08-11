@@ -2,10 +2,15 @@ import 'dart:typed_data';
 
 import 'package:meta/meta.dart';
 
+import 'abi.dart';
 import 'errors.dart';
 
-/// File magic for a marineford patch container: `MFP1`.
-const List<int> kMfpMagic = <int>[0x44, 0x44, 0x4d, 0x31];
+/// File magic for a marineford patch container: `MFP1` in ASCII.
+///
+/// Spelled from the characters rather than hex on purpose. It was hex once, and
+/// a project rename updated every mention of the old magic in prose while
+/// leaving the bytes saying the old thing.
+final List<int> kMfpMagic = List<int>.unmodifiable('MFP1'.codeUnits);
 
 /// Highest container schema this build understands.
 const int kMaxMfpSchema = 1;
@@ -20,27 +25,45 @@ const int kMfpSignatureLength = 64;
 /// payload.
 const int kMfpMinLength = kMfpHeaderLength + kMfpSignatureLength;
 
+/// Largest container this build will parse.
+///
+/// A patch is kilobytes. This is not a tuning knob — it is a ceiling on how much
+/// a hostile or broken server can make the client hold in memory before any of
+/// it has been verified.
+const int kMfpMaxLength = 8 * 1024 * 1024;
+
 /// Capability bits in the container header.
 ///
 /// A client refuses any container whose flags include a bit it does not
 /// implement. That refusal is the whole point: it turns "a newer patch reached
 /// an older app" from a crash into a log line.
 extension type const MfpFlags(int bits) {
+  static const int _gzip = 1 << 0;
+  static const int _flutterBridge = 1 << 1;
+
+  /// Every bit this build implements, as a raw mask.
+  ///
+  /// One source of truth, spelled from the same constants the individual flags
+  /// use. Written as its own literal it would be free to drift from them, and a
+  /// mask that claims more than the code implements is a patch loaded with a
+  /// capability nobody provides.
+  static const int _supported = _gzip;
+
   /// No capabilities requested.
   static const MfpFlags none = MfpFlags(0);
 
   /// The payload is gzip-compressed.
-  static const MfpFlags gzip = MfpFlags(1 << 0);
+  static const MfpFlags gzip = MfpFlags(_gzip);
 
   /// The patch needs the Flutter widget bridge.
   ///
   /// Reserved for v2 and never set by v1 publishers. A v1 client that sees it
   /// rejects the patch with [UnsupportedFlagsException] instead of loading a
   /// program whose bridge it cannot provide.
-  static const MfpFlags flutterBridge = MfpFlags(1 << 1);
+  static const MfpFlags flutterBridge = MfpFlags(_flutterBridge);
 
   /// Everything this build knows how to honour.
-  static const MfpFlags supported = MfpFlags(1);
+  static const MfpFlags supported = MfpFlags(_supported);
 
   /// Whether [other]'s bits are all set here.
   bool has(MfpFlags other) => bits & other.bits == other.bits;
@@ -73,10 +96,10 @@ final class MfpContainer {
   const MfpContainer._({
     required this.flags,
     required this.schema,
-    required this.abiHash,
+    required this.abi,
     required this.payload,
     required this.signature,
-    required this.bytes,
+    required this.signedRegion,
   });
 
   /// Capability bits the publisher set.
@@ -85,39 +108,36 @@ final class MfpContainer {
   /// Container schema version.
   final int schema;
 
-  /// Raw 32-byte ABI fingerprint the patch was built against.
-  final Uint8List abiHash;
+  /// The fingerprint of the build this patch was compiled against.
+  final AbiFingerprint abi;
 
   /// The patch program, still compressed if [MfpFlags.gzip] is set.
+  ///
+  /// A copy, not a view onto the original buffer: a view would let a caller
+  /// mutate the bytes the signature was checked over.
   final Uint8List payload;
 
   /// The Ed25519 signature trailer.
   final Uint8List signature;
 
-  /// The complete original file.
-  final Uint8List bytes;
-
   /// The bytes the signature covers: everything except the signature itself.
-  Uint8List get signedRegion =>
-      Uint8List.sublistView(bytes, 0, bytes.length - kMfpSignatureLength);
-
-  /// The ABI fingerprint in manifest form, `sha256:<hex>`.
-  String get abi {
-    final buffer = StringBuffer('sha256:');
-    for (final byte in abiHash) {
-      buffer.write(byte.toRadixString(16).padLeft(2, '0'));
-    }
-    return buffer.toString();
-  }
+  final Uint8List signedRegion;
 
   /// Parses a container, checking only that it is structurally sound.
   ///
   /// Throws [MfpFormatException] if the bytes are not a container, and
   /// [UnsupportedFlagsException] if they are but ask for capabilities this
   /// build does not have.
-  factory MfpContainer.parse(Uint8List bytes,
-      {int maxSchema = kMaxMfpSchema,
-      MfpFlags supported = MfpFlags.supported}) {
+  factory MfpContainer.parse(
+    Uint8List bytes, {
+    int maxSchema = kMaxMfpSchema,
+    MfpFlags supported = MfpFlags.supported,
+    int maxLength = kMfpMaxLength,
+  }) {
+    if (bytes.length > maxLength) {
+      throw MfpFormatException('file is ${bytes.length} bytes, over the '
+          '$maxLength byte ceiling');
+    }
     if (bytes.length < kMfpMinLength) {
       throw MfpFormatException('file is ${bytes.length} bytes, shorter than '
           'the $kMfpMinLength byte minimum for a patch container');
@@ -153,12 +173,13 @@ final class MfpContainer {
     return MfpContainer._(
       flags: flags,
       schema: schema,
-      abiHash: Uint8List.sublistView(bytes, 8, 40),
-      payload: Uint8List.sublistView(
-          bytes, kMfpHeaderLength, kMfpHeaderLength + payloadLength),
-      signature:
-          Uint8List.sublistView(bytes, bytes.length - kMfpSignatureLength),
-      bytes: bytes,
+      abi: AbiFingerprint.fromBytes(Uint8List.sublistView(bytes, 8, 40)),
+      payload: Uint8List.fromList(Uint8List.sublistView(
+          bytes, kMfpHeaderLength, kMfpHeaderLength + payloadLength)),
+      signature: Uint8List.fromList(
+          Uint8List.sublistView(bytes, bytes.length - kMfpSignatureLength)),
+      signedRegion: Uint8List.fromList(
+          Uint8List.sublistView(bytes, 0, bytes.length - kMfpSignatureLength)),
     );
   }
 
@@ -168,20 +189,16 @@ final class MfpContainer {
   /// final file. Kept separate from signing so this stays pure and testable.
   static Uint8List buildSignedRegion({
     required Uint8List payload,
-    required Uint8List abiHash,
+    required AbiFingerprint abi,
     MfpFlags flags = MfpFlags.gzip,
     int schema = kMaxMfpSchema,
   }) {
-    if (abiHash.length != 32) {
-      throw ArgumentError.value(
-          abiHash.length, 'abiHash.length', 'ABI fingerprint must be 32 bytes');
-    }
     final out = Uint8List(kMfpHeaderLength + payload.length);
     out.setRange(0, 4, kMfpMagic);
     final view = ByteData.view(out.buffer);
     view.setUint16(4, flags.bits, Endian.little);
     view.setUint16(6, schema, Endian.little);
-    out.setRange(8, 40, abiHash);
+    out.setRange(8, 40, abi.toBytes());
     view.setUint32(40, payload.length, Endian.little);
     out.setRange(kMfpHeaderLength, out.length, payload);
     return out;

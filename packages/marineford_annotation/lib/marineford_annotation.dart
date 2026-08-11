@@ -6,6 +6,8 @@
 /// to do so.
 library;
 
+import 'package:meta/meta_meta.dart';
+
 /// Marks a top-level function as replaceable by a patch at runtime.
 ///
 /// The generator emits a public wrapper that dispatches to a patch when one is
@@ -22,12 +24,18 @@ library;
 /// ```
 ///
 /// Marking is not free of consequence but is close to free of cost: when no
-/// patch is active a marked call measures ~2.4ns against ~1.7ns unmarked. Mark
-/// liberally — but never inside a hot loop or per-frame code, where the ~2.5µs
-/// cost of actually crossing into the interpreter would show up.
+/// patch is active a marked call measures a few nanoseconds against a direct
+/// one. Mark liberally — but never inside a hot loop or per-frame code, where
+/// the microseconds it costs to actually cross into the interpreter would show
+/// up.
 ///
 /// Code that was not marked before it shipped can never be patched. See
 /// [PatchableService] for marking a whole class at once.
+///
+/// Restricted to top-level functions by [Target]. Putting it on a class or a
+/// method used to generate nothing at all and say nothing about it — the most
+/// natural mistake there is, with total silence as its result.
+@Target(<TargetKind>{TargetKind.function})
 final class Patchable {
   /// Creates a [Patchable] annotation.
   const Patchable({this.id});
@@ -45,7 +53,7 @@ final class Patchable {
 /// Shorthand for `Patchable()`.
 const patchable = Patchable();
 
-/// Marks every public method of a class as replaceable by a patch.
+/// Marks every public instance method of a class as replaceable by a patch.
 ///
 /// The generator emits a subclass whose overrides dispatch to a patch when one
 /// is active. Annotate a base class and use the generated subclass at your call
@@ -61,21 +69,33 @@ const patchable = Patchable();
 /// // generated: class PricingRules extends PricingRulesBase { ... }
 /// ```
 ///
+/// Only methods declared on the annotated class are covered — not inherited
+/// ones, and not getters or setters. The generated class forwards whatever
+/// constructors the base declares, so a service that takes dependencies works
+/// unchanged.
+///
 /// A patch that replaces one of these methods rewrites the whole body, so it
 /// can also repair bugs in the unmarked private helpers that method calls — it
 /// simply stops calling them. That makes a service class a good boundary: you
 /// do not have to predict which leaf function will break, only which entry
 /// point sits above it.
+@Target(<TargetKind>{TargetKind.classType})
 final class PatchableService {
   /// Creates a [PatchableService] annotation.
-  const PatchableService({this.name, this.exclude = const []});
+  const PatchableService({this.name, this.exclude = const <String>[]});
 
-  /// Overrides the generated class name prefix used to build dispatch ids.
+  /// Overrides the generated class name.
+  ///
+  /// By default a trailing `Base` is stripped, so `PricingRulesBase` generates
+  /// `PricingRules`.
   final String? name;
 
   /// Method names to leave unmarked.
   ///
-  /// Use for hot paths that should never pay the dispatch check.
+  /// Use for hot paths that should never pay the dispatch check. A name here
+  /// that matches no method is a build error rather than a silent no-op: an
+  /// excluded-but-misspelled hot path is marked, which is the opposite of what
+  /// was asked for.
   final List<String> exclude;
 }
 
@@ -85,18 +105,20 @@ final class PatchableService {
 /// registry; `marineford doctor` verifies this before you publish.
 ///
 /// [version] is a pub_semver constraint checked against the running app's
-/// version. Use it to retire a patch automatically once a store release ships
-/// the same fix natively:
+/// version. It is effectively required: leave it out and dart_eval substitutes
+/// a constraint on *its own* version, which no app satisfies, so the override
+/// compiles, publishes and silently never fires. `marineford build` warns.
 ///
 /// ```dart
-/// @RuntimeOverride('pkg:app/pricing.dart#PricingRules.cartTotal',
+/// @RuntimeOverride('pkg:app/lib/pricing.dart#PricingRules.cartTotal',
 ///     version: '>=1.4.0 <1.5.0')
 /// int cartTotalFixed(Cart cart) => 0;
 /// ```
 ///
 /// The class name is significant: dart_eval's compiler matches this annotation
-/// by identifier, so it cannot be renamed or aliased.
-// ignore: camel_case_types
+/// by identifier, so it cannot be renamed or aliased. It is also deliberately
+/// *not* restricted by [Target] — the patch package is compiled by dart_eval,
+/// not by the Dart SDK, and the analyzer never sees it.
 final class RuntimeOverride {
   /// Creates a [RuntimeOverride] annotation.
   const RuntimeOverride(this.id, {this.version});

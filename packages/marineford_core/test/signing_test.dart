@@ -156,7 +156,7 @@ void main() {
     test('a signed container verifies, and any edit to it does not', () async {
       final region = MfpContainer.buildSignedRegion(
         payload: Uint8List.fromList(List.generate(2000, (i) => i % 256)),
-        abiHash: Uint8List(32)..fillRange(0, 32, 0x11),
+        abi: AbiFingerprint.fromBytes(Uint8List(32)..fillRange(0, 32, 0x11)),
       );
       final sig = await signer.sign(region);
       final file = Uint8List.fromList([...region, ...sig]);

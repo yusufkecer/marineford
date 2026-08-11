@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:marineford_core/marineford_core.dart';
 import 'package:pub_semver/pub_semver.dart';
@@ -32,6 +33,7 @@ Map<String, Object?> manifestJson({
   Object? schema = 1,
   Object? app = 'com.example.app',
   Object? channel = 'prod',
+  Object? sequence = 1,
   Object? generatedAt = '2026-08-10T12:00:00Z',
   Object? patches,
   Object? revoked,
@@ -40,6 +42,7 @@ Map<String, Object?> manifestJson({
       'schema': schema,
       'app': app,
       'channel': channel,
+      'sequence': sequence,
       'generatedAt': generatedAt,
       'patches': patches ?? [patchJson()],
       if (revoked != null) 'revoked': revoked,
@@ -48,10 +51,10 @@ Map<String, Object?> manifestJson({
 void main() {
   group('valid input', () {
     test('parses a complete manifest', () {
-      final m = PatchManifest.parse(jsonEncode(manifestJson(
+      final m = PatchManifest.fromJson(manifestJson(
         patches: [patchJson(rollout: 0.25, notes: 'pricing fix')],
         revoked: [5, 6],
-      )));
+      ));
       expect(m.appId, 'com.example.app');
       expect(m.channel, 'prod');
       expect(m.revoked, {5, 6});
@@ -63,7 +66,7 @@ void main() {
     });
 
     test('rollout defaults to 1.0 and revoked to empty', () {
-      final m = PatchManifest.parse(jsonEncode(manifestJson()));
+      final m = PatchManifest.fromJson(manifestJson());
       expect(m.patches.single.rollout, 1.0);
       expect(m.revoked, isEmpty);
     });
@@ -77,10 +80,10 @@ void main() {
     });
 
     test('round-trips through toJson', () {
-      final original = PatchManifest.parse(jsonEncode(manifestJson(
+      final original = PatchManifest.fromJson(manifestJson(
         patches: [patchJson(rollout: 0.5)],
         revoked: [3],
-      )));
+      ));
       final again = PatchManifest.fromJson(original.toJson());
       expect(again.toJson(), original.toJson());
     });
@@ -111,14 +114,22 @@ void main() {
     }
 
     test('not JSON at all', () {
-      expect(() => PatchManifest.parse('<html>404</html>'),
+      expect(
+          () => SignedManifest.parse(
+              Uint8List.fromList(utf8.encode('<html>404</html>'))),
           throwsA(isA<ManifestFormatException>()));
     });
 
     test('JSON but not an object', () {
-      expect(() => PatchManifest.parse('[1,2,3]'),
+      expect(
+          () =>
+              SignedManifest.parse(Uint8List.fromList(utf8.encode('[1,2,3]'))),
           throwsA(isA<ManifestFormatException>()));
     });
+
+    rejects('missing sequence', manifestJson()..remove('sequence'));
+    rejects('sequence zero', manifestJson(sequence: 0));
+    rejects('sequence as string', manifestJson(sequence: '1'));
 
     rejects('missing schema', manifestJson()..remove('schema'));
     rejects('schema as string', manifestJson(schema: '1'));
