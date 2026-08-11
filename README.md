@@ -15,7 +15,7 @@ That one line, shipped in v1.4.0, is enough to absorb almost any change your
 backend makes afterwards.
 
 > **Status: pre-release.** Not on pub.dev yet. The pipeline works end to end and
-> is covered by 239 tests; the API may still move before 0.1.0.
+> is covered by 336 tests; the API may still move before 0.1.0.
 
 ---
 
