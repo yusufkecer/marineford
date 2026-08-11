@@ -20,7 +20,7 @@ final class AbiFingerprint {
   /// The `sha256:` prefix every textual form carries.
   static const String prefix = 'sha256:';
 
-  static final RegExp _text = RegExp('^$prefix[0-9a-f]{64}\$');
+  static const int _textLength = prefix.length + lengthInBytes * 2;
 
   final Uint8List _bytes;
 
@@ -38,25 +38,52 @@ final class AbiFingerprint {
 
   /// Parses the `sha256:<64 lowercase hex>` form.
   factory AbiFingerprint.parse(String value) {
-    if (!_text.hasMatch(value)) {
+    final bytes = _decode(value);
+    if (bytes == null) {
       throw FormatException(
           'an ABI fingerprint looks like $prefix<64 lowercase hex digits>, '
           'got "$value"');
     }
-    final hex = value.substring(prefix.length);
-    return AbiFingerprint._(Uint8List.fromList(<int>[
-      for (var i = 0; i < lengthInBytes; i++)
-        int.parse(hex.substring(i * 2, i * 2 + 2), radix: 16),
-    ]));
+    return AbiFingerprint._(bytes);
   }
 
   /// Parses [value], or returns null instead of throwing.
   static AbiFingerprint? tryParse(String value) {
-    try {
-      return AbiFingerprint.parse(value);
-    } on FormatException {
-      return null;
+    final bytes = _decode(value);
+    return bytes == null ? null : AbiFingerprint._(bytes);
+  }
+
+  /// Validates and decodes in one pass, or returns null.
+  ///
+  /// By hand rather than by regex and `int.parse`, because the previous version
+  /// allocated 33 substrings and a match object to produce 32 bytes — on a path
+  /// that runs for every entry of every manifest the client reads. Reading code
+  /// units costs nothing and, more usefully, folds validation and decoding into
+  /// the same loop so the two cannot disagree about what is accepted.
+  static Uint8List? _decode(String value) {
+    if (value.length != _textLength) return null;
+    for (var i = 0; i < prefix.length; i++) {
+      if (value.codeUnitAt(i) != prefix.codeUnitAt(i)) return null;
     }
+    final bytes = Uint8List(lengthInBytes);
+    for (var i = 0; i < lengthInBytes; i++) {
+      final high = _nibble(value.codeUnitAt(prefix.length + i * 2));
+      final low = _nibble(value.codeUnitAt(prefix.length + i * 2 + 1));
+      if (high < 0 || low < 0) return null;
+      bytes[i] = (high << 4) | low;
+    }
+    return bytes;
+  }
+
+  /// One hex digit, or -1.
+  ///
+  /// Lowercase only. Uppercase is a different string for the same value, and
+  /// accepting both would mean a fingerprint that compares equal as bytes but
+  /// not as text — which is how two spellings of one build end up in a manifest.
+  static int _nibble(int codeUnit) {
+    if (codeUnit >= 0x30 && codeUnit <= 0x39) return codeUnit - 0x30;
+    if (codeUnit >= 0x61 && codeUnit <= 0x66) return codeUnit - 0x57;
+    return -1;
   }
 
   /// The raw digest, as a copy.
@@ -64,12 +91,19 @@ final class AbiFingerprint {
 
   @override
   String toString() {
-    final buffer = StringBuffer(prefix);
-    for (final byte in _bytes) {
-      buffer.write(byte.toRadixString(16).padLeft(2, '0'));
+    final units = Uint8List(_textLength);
+    for (var i = 0; i < prefix.length; i++) {
+      units[i] = prefix.codeUnitAt(i);
     }
-    return buffer.toString();
+    for (var i = 0; i < lengthInBytes; i++) {
+      units[prefix.length + i * 2] = _hexDigit(_bytes[i] >> 4);
+      units[prefix.length + i * 2 + 1] = _hexDigit(_bytes[i] & 0xf);
+    }
+    return String.fromCharCodes(units);
   }
+
+  static int _hexDigit(int nibble) =>
+      nibble < 10 ? 0x30 + nibble : 0x57 + nibble;
 
   @override
   bool operator ==(Object other) {

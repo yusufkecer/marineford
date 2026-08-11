@@ -17,6 +17,29 @@ void main() {
       expect(AbiFingerprint.fromBytes(bytes).toString(), 'sha256:${'ab' * 32}');
     });
 
+    test('every byte value survives the round trip', () {
+      // The hand-rolled hex codec has two nibble branches in each direction,
+      // and a wrong boundary — `f`/`9`, or the high nibble — would still pass a
+      // test that only ever used 0xab.
+      final bytes = Uint8List.fromList(<int>[
+        for (var i = 0; i < 32; i++) (i * 8 + i) & 0xff,
+      ]);
+      final text = AbiFingerprint.fromBytes(bytes).toString();
+      expect(AbiFingerprint.parse(text).toBytes(), bytes);
+
+      final extremes = Uint8List(32)
+        ..[0] = 0x00
+        ..[1] = 0x0f
+        ..[2] = 0xf0
+        ..[3] = 0xff
+        ..[4] = 0x9a
+        ..[5] = 0xa9;
+      expect(
+          AbiFingerprint.parse(AbiFingerprint.fromBytes(extremes).toString())
+              .toBytes(),
+          extremes);
+    });
+
     test('text and bytes agree', () {
       final fromText = AbiFingerprint.parse('sha256:${'ab' * 32}');
       final fromBytes =
@@ -41,6 +64,10 @@ void main() {
     rejects('too long', 'sha256:${'a' * 65}');
     rejects('empty', '');
     rejects('non-hex', 'sha256:${'g' * 64}');
+    // Right length, wrong prefix. Without this the length check alone could
+    // pass for something that is not a sha256 fingerprint at all.
+    rejects('a prefix of the right length', 'sha257:${'a' * 64}');
+    rejects('one bad digit in the middle', 'sha256:${'a' * 31}z${'a' * 32}');
 
     test('wrong byte length', () {
       // A truncated fingerprint must never silently become a different valid
