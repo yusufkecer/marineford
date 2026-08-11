@@ -167,4 +167,81 @@ class RuntimeOverride {
       expect(identical(MarinefordJson.wrap(sentinel), sentinel), isTrue);
     });
   });
+
+  group('the return path builds the result once', () {
+    // unwrapMap and unwrapList used to call unwrap and then rebuild what it
+    // returned. Reaching into the interpreter's own container instead is what
+    // removed the second pass, and it means these entry points no longer share
+    // a code path with unwrap — so every shape has to be checked against them
+    // directly rather than assumed to follow from the unwrap tests above.
+
+    test('a deeply nested map comes back whole', () {
+      final original = <String, dynamic>{
+        'status': 'ok',
+        'rows': <dynamic>[
+          <String, dynamic>{
+            'id': 1,
+            'tags': <dynamic>['a', 'b'],
+          },
+          <String, dynamic>{
+            'id': 2,
+            'nested': <String, dynamic>{'deep': true},
+          },
+        ],
+        'nothing': null,
+      };
+      expect(MarinefordJson.unwrapMap(MarinefordJson.wrap(original)), original);
+    });
+
+    test('a plain Dart map full of interpreter values still converts', () {
+      // The fast path returns the caller's map untouched, so its values are
+      // still $Values and have to be unwrapped one by one on the way out.
+      expect(
+        MarinefordJson.unwrapMap(<Object?, Object?>{
+          'a': MarinefordJson.wrap(1),
+          'b': MarinefordJson.wrap(<dynamic>['x']),
+        }),
+        <String, dynamic>{
+          'a': 1,
+          'b': <dynamic>['x'],
+        },
+      );
+    });
+
+    test('a non-string key becomes one rather than a cast error', () {
+      // Not valid JSON, but a patch can produce it, and the alternative is a
+      // failure thrown from somewhere the app author cannot see.
+      final result = MarinefordJson.unwrapMap(
+          MarinefordJson.wrap(<Object?, Object?>{1: 'one', true: 'yes'}));
+      expect(result, <String, dynamic>{'1': 'one', 'true': 'yes'});
+    });
+
+    test('unwrapList converts the elements it hands back', () {
+      // The old version returned unwrap's list as-is. The new one builds the
+      // list itself, so it owns the element conversion too.
+      expect(
+        MarinefordJson.unwrapList(MarinefordJson.wrap(<dynamic>[
+          <String, dynamic>{'a': 1},
+          <dynamic>[2],
+          null,
+        ])),
+        <dynamic>[
+          <String, dynamic>{'a': 1},
+          <dynamic>[2],
+          null,
+        ],
+      );
+      expect(
+        MarinefordJson.unwrapList(<Object?>[MarinefordJson.wrap('x')]),
+        <dynamic>['x'],
+      );
+    });
+
+    test('a bridged object survives the return path too', () {
+      final sentinel = Object();
+      final result = MarinefordJson.unwrapMap(
+          MarinefordJson.wrap(<String, dynamic>{'opaque': sentinel}));
+      expect(identical(result!['opaque'], sentinel), isTrue);
+    });
+  });
 }
