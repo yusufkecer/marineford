@@ -47,9 +47,14 @@ final class SelectionContext {
 
   /// Highest manifest sequence this device has accepted.
   ///
-  /// Anything at or below this is stale and ignored. Without it, an attacker
+  /// Anything strictly below this is stale and ignored. Without it, an attacker
   /// who controls the CDN can keep serving the last manifest published before a
   /// revocation, and the kill switch silently never arrives.
+  ///
+  /// Equal is accepted, not rejected. Re-reading an unchanged manifest is the
+  /// ordinary case — it is what every check does when the publisher has not
+  /// published since — and refusing it would cry wolf on the normal path and
+  /// teach whoever reads the logs to ignore the warning that matters.
   final int lastSequence;
 }
 

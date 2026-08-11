@@ -51,9 +51,10 @@ final class PatchState {
 
   /// Highest manifest sequence accepted so far.
   ///
-  /// Anything at or below this is stale. Signatures never expire, so without
-  /// this an old manifest can be replayed forever — including one published
-  /// before a revocation.
+  /// Anything strictly below this is stale — equal is the ordinary case of
+  /// re-reading an unchanged manifest. Signatures never expire, so without this
+  /// an old manifest can be replayed forever, including one published before a
+  /// revocation.
   final int lastSequence;
 
   /// Returns a copy with the given fields replaced.
