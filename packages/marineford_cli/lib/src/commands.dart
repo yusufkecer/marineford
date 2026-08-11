@@ -124,7 +124,17 @@ size_budget_kb: 256
     Version? appVersionMin,
   }) async {
     final signer = await _loadSigner(project);
-    final registry = abiOverride == null ? _requireRegistry(project) : null;
+
+    // --abi replaces one thing: the fingerprint. It says nothing about which
+    // dispatch ids exist, and those two only travelled together because they
+    // happen to be written to the same file. Treating the flag as "ignore the
+    // registry" turned off the typo check as a side effect — and a mistyped
+    // id is not an error anywhere else in the pipeline. It builds, it signs,
+    // it publishes, and it never fires on a single device.
+    final registry = abiOverride == null
+        ? _requireRegistry(project)
+        : project.readIdRegistry();
+
     final AbiFingerprint abi;
     try {
       abi = AbiFingerprint.parse(abiOverride ?? registry!.abi);
@@ -136,9 +146,9 @@ size_budget_kb: 256
       );
     }
 
-    if (abiOverride != null) {
-      console.write('note: --abi bypasses the generated registry, so override '
-          'ids cannot be checked for typos.');
+    if (abiOverride != null && registry == null) {
+      console.write('note: --abi was given and there is no marineford_ids.json '
+          'to read, so override ids cannot be checked for typos.');
     }
 
     final built = await PatchBuilder(project).build(
@@ -398,7 +408,10 @@ size_budget_kb: 256
             bad(
                 'the patch overrides ids the app does not declare: '
                     '${unknown.join(', ')}',
-                'They will never fire. Check the spelling, or rebuild the app.');
+                'They will never fire. Check the spelling; rebuild the app if '
+                    'the function is new; and if it lives in a package the app '
+                    'depends on, move it into the app — the registry and the '
+                    'ABI fingerprint only cover this package.');
           }
         }
       } on CliException catch (e) {
