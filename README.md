@@ -563,9 +563,29 @@ That is a lot for screen-level logic and very little for anything per-item.
 | A patch that throws at runtime | Every call falls back to the original function; repeated failures drop the patch for the session |
 | A patch you need gone now | `marineford revoke` — devices roll back on their next check |
 | A misdirected manifest | Ignored, never acted on — otherwise anyone who could swap the file could force a downgrade |
+| A manifest for the wrong channel | Ignored too. Nothing else compares the two, and a prod build pointed at a beta URL is an easy mistake |
+| A patch that inflates to gigabytes | Decompression stops at 64MB. The container cap bounds the download, not what it expands to |
+| A patch that fails asynchronously | Dispatch runs in a guarded zone, so a Future the patch never awaited is counted like any other failure instead of reaching your error handler |
 
-Interpreted code sees nothing by default. No file system, no network, no
-platform channels.
+### What a patch can reach
+
+Its arguments, and the bridges you registered. Nothing else: no file system, no
+network, no processes, no platform channels.
+
+That is enforced in two places, and it is worth knowing which. dart_eval is
+default-deny and checks a permission before each `dart:io` call; marineford
+grants none, so those throw. But `InternetAddress.lookup` was never gated
+upstream, and it ran — a patch could encode data into a hostname and exfiltrate
+it over DNS, around the network permission entirely. marineford now takes over
+`dart:io`'s ungated entry points and refuses them itself, and `marineford build`
+rejects a patch that imports `dart:io` at all.
+
+Reaching any of this needs the signing key, so the threat is a malicious patch
+author or a stolen key rather than a stranger. That is exactly why the blast
+radius has to be what the documentation says it is.
+
+If a patch genuinely needs a capability, `permissions` on `MarinefordConfig`
+grants it explicitly and narrowly. Granting widens what a stolen key is worth.
 
 ### Store policy
 
