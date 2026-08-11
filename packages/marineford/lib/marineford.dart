@@ -43,6 +43,7 @@ export 'src/dispatch.dart'
     show Patch, PatchFailureHandler, patchedNull, resolveSlots;
 export 'src/json_bridge.dart' show MarinefordJson;
 export 'src/observer.dart';
+export 'src/sandbox.dart' show MarinefordSandbox, PatchDeniedException;
 export 'src/store.dart' show PatchState, PatchStore;
 export 'src/transport.dart'
     show

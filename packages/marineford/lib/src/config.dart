@@ -1,4 +1,5 @@
 import 'package:dart_eval/dart_eval_bridge.dart' show EvalPlugin;
+import 'package:dart_eval/dart_eval_security.dart' show Permission;
 import 'package:marineford_core/marineford_core.dart' show AbiFingerprint;
 import 'package:meta/meta.dart';
 import 'package:pub_semver/pub_semver.dart';
@@ -45,6 +46,7 @@ final class MarinefordConfig {
     this.observer,
     this.transport,
     this.plugins = const <EvalPlugin>[],
+    this.permissions = const <Permission>[],
   }) : fingerprint = AbiFingerprint.parse(abi);
 
   /// Application id. Must match the manifest, or the manifest is ignored.
@@ -105,9 +107,32 @@ final class MarinefordConfig {
 
   /// Bridges exposed to interpreted code.
   ///
-  /// Empty by default, and that default matters: a patch can only touch what
-  /// you list here. Adding a bridge grants that capability to anyone who can
-  /// publish a patch, so add the app's own domain classes and stop there —
-  /// not file system, network, or platform channel wrappers.
+  /// Empty by default, and that default matters: a patch can only reach the
+  /// arguments it is handed and the bridges you list here. Adding a bridge
+  /// grants that capability to anyone who can publish a patch, so add the app's
+  /// own domain classes and stop there.
+  ///
+  /// A bridge you write yourself has no permission checks in it. Whatever it
+  /// exposes is exposed unconditionally — [permissions] governs `dart:io`, not
+  /// your code.
   final List<EvalPlugin> plugins;
+
+  /// Capabilities granted to interpreted code, on top of nothing.
+  ///
+  /// Empty means a patch cannot read a file, open a socket, or start a process.
+  /// That is enforced by dart_eval, which is default-deny and checks
+  /// `assertPermission` before each of those — plus marineford's own sandbox
+  /// plugin, which covers the `dart:io` entry points dart_eval forgot to check.
+  ///
+  /// This field exists so the answer lives here rather than in dart_eval's
+  /// defaults. Relying on someone else's default meant that if it ever changed,
+  /// every app using marineford would inherit the change without a line of code
+  /// moving — and the sandbox is the part of this library least able to afford
+  /// a surprise.
+  ///
+  /// Granting anything widens the blast radius of a stolen signing key from
+  /// "the bodies of marked functions" to whatever you grant. If a patch needs
+  /// to read one specific file, grant exactly that path; the alternative people
+  /// reach for otherwise is a hand-written bridge, which has no checks at all.
+  final List<Permission> permissions;
 }

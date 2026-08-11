@@ -11,6 +11,7 @@ import 'package:path_provider/path_provider.dart';
 import 'config.dart';
 import 'dispatch.dart';
 import 'observer.dart';
+import 'sandbox.dart';
 import 'store.dart';
 import 'transport.dart';
 
@@ -213,6 +214,14 @@ final class MarinefordClient {
         .asByteData(bytecode.offsetInBytes, bytecode.lengthInBytes));
     for (final plugin in config.plugins) {
       runtime.addPlugin(plugin);
+    }
+    // Last, and that is the point. dart_eval configures plugins in the order
+    // they were added and the last registration of a bridge wins, so adding
+    // this after both DartIoPlugin and the app's own plugins is what lets it
+    // take dart:io's ungated functions away from them.
+    runtime.addPlugin(const MarinefordSandbox());
+    for (final permission in config.permissions) {
+      runtime.grant(permission);
     }
     runtime.loadGlobalOverrides();
 
