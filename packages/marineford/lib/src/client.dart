@@ -43,10 +43,31 @@ final class MarinefordClient {
   PatchState? _state;
   Timer? _confirmTimer;
   Future<PatchDecision>? _inFlight;
+  Future<void>? _maintenance;
 
   /// Persisted state. Available after [start].
+  ///
+  /// Can lag by a moment after a patch is abandoned at runtime. Giving up on a
+  /// patch is triggered from inside interpreted code, on a callback that cannot
+  /// wait for a disk write, so the write is started and not awaited. Use
+  /// [settled] before reading this if you need the answer to be final.
   PatchState get state =>
       _state ?? (throw StateError('MarinefordClient.start() has not run yet'));
+
+  /// Completes when background writes have landed.
+  ///
+  /// There is exactly one thing the client does without being asked: abandon a
+  /// patch whose interpreted code keeps throwing. That decision arrives on a
+  /// dispatch callback, several frames inside the interpreter, where awaiting a
+  /// file write is not an option — so it is started and left to finish.
+  ///
+  /// Which means [state] is briefly stale afterwards, and nothing said so.
+  /// Anything that reads state to log it, report it, or assert on it needs a
+  /// point to wait for, and a fixed delay is not one.
+  Future<void> get settled async {
+    await _inFlight;
+    await _maintenance;
+  }
 
   /// The patch currently dispatching, or 0 if the store build is running.
   int get activePatch => Patch.isActive ? (_activeNumber ?? 0) : 0;
@@ -203,8 +224,16 @@ final class MarinefordClient {
       onFailure: (id, error, stackTrace) {
         _emit(PatchFailure(id, error, stackTrace, Patch.failureCount));
         if (Patch.failureCount >= config.failureThreshold) {
-          unawaited(_blocklist(state, number,
-              'threw ${Patch.failureCount} times in a row while running'));
+          // Recorded rather than dropped, so `settled` has something to wait
+          // on. Fire-and-forget is forced here — this runs on a dispatch
+          // callback inside the interpreter — but forgetting the future
+          // entirely left callers with no way to know when state was final.
+          final write = _blocklist(state, number,
+              'threw ${Patch.failureCount} times in a row while running');
+          _maintenance = write;
+          unawaited(write.whenComplete(() {
+            if (identical(_maintenance, write)) _maintenance = null;
+          }));
         }
       },
     );
