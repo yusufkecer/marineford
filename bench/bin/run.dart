@@ -46,6 +46,7 @@ void main(List<String> args) {
 
   results.addAll(_dispatchCosts());
   results.addAll(_interpreterCosts());
+  results.addAll(_jsonBridgeCosts());
   results.addAll(_patchSizes());
 
   stdout.writeln('');
@@ -226,15 +227,65 @@ String parse(Map response) {
 }
 ''';
 
+/// A copy of `MarinefordJson.wrap`.
+///
+/// Copied rather than imported: the runtime package depends on Flutter and this
+/// one deliberately does not, so a `flutter test` harness is not sitting between
+/// the stopwatch and the code. Keep it in step with `json_bridge.dart`.
 Object? _wrap(Object? value) {
   if (value == null) return $null();
   if (value is String) return $String(value);
   if (value is int) return $int(value);
+  if (value is double) return $double(value);
   if (value is bool) return $bool(value);
+  if (value is List) {
+    return $List.wrap(<Object?>[for (final item in value) _wrap(item)]);
+  }
   if (value is Map) {
     return $Map.wrap(<Object?, Object?>{
       for (final e in value.entries) _wrap(e.key): _wrap(e.value),
     });
+  }
+  return value;
+}
+
+/// A copy of `MarinefordJson.unwrap`.
+Object? _unwrap(Object? value) {
+  if (value is $Map) {
+    return <Object?, Object?>{
+      for (final e in value.$value.entries) _unwrap(e.key): _unwrap(e.value),
+    };
+  }
+  if (value is $List) {
+    return <Object?>[for (final item in value.$value) _unwrap(item)];
+  }
+  if (value is $Value) return _unwrap(value.$reified);
+  if (value is Map) {
+    return <Object?, Object?>{
+      for (final e in value.entries) _unwrap(e.key): _unwrap(e.value),
+    };
+  }
+  if (value is List) {
+    return <Object?>[for (final item in value) _unwrap(item)];
+  }
+  return value;
+}
+
+/// The shape it had before: every container reached through `$reified`.
+///
+/// Kept as the comparison the change is argued from. `$reified` is recursive,
+/// so this builds the whole plain structure and then walks the result and
+/// builds it again.
+Object? _unwrapViaReified(Object? value) {
+  if (value is $Value) return _unwrapViaReified(value.$reified);
+  if (value is Map) {
+    return <Object?, Object?>{
+      for (final e in value.entries)
+        _unwrapViaReified(e.key): _unwrapViaReified(e.value),
+    };
+  }
+  if (value is List) {
+    return <Object?>[for (final item in value) _unwrapViaReified(item)];
   }
   return value;
 }
@@ -289,6 +340,53 @@ List<_Result> _interpreterCosts() {
         budget: 15),
     _Result('interpreted loop iteration', perIteration, 'ns', budget: 600),
     _Result('realistic JSON normaliser call', parse / 1000, 'us', budget: 25),
+  ];
+}
+
+// --- the JSON bridge ---------------------------------------------------------
+
+/// A payload of [fields] keys, [rows] of them if nested.
+Object _payload({required int fields, int rows = 0}) {
+  Map<String, Object?> row(int i) => <String, Object?>{
+        for (var f = 0; f < fields; f++) 'field_$f': f.isEven ? 'value_$f' : f,
+        'index': i,
+      };
+  if (rows == 0) return row(0);
+  return <String, Object?>{
+    'status': 'ok',
+    'data': <Object?>[for (var i = 0; i < rows; i++) row(i)],
+  };
+}
+
+/// Prices the deep wrap that every marked call with a JSON argument pays.
+///
+/// The design assumes this is small next to the ~2.6µs it costs to enter the
+/// interpreter at all — which is the argument for wrapping eagerly instead of
+/// building a lazy view over the original map. Assumptions like that are worth
+/// a number, because the conclusion flips if a payload is big enough.
+List<_Result> _jsonBridgeCosts() {
+  stdout.writeln('Measuring the JSON bridge...');
+
+  final small = _payload(fields: 5);
+  final wide = _payload(fields: 50);
+  final nested = _payload(fields: 8, rows: 50);
+
+  final wrapSmall = _timeNs(200000, () => _wrap(small));
+  final wrapWide = _timeNs(50000, () => _wrap(wide));
+  final wrapNested = _timeNs(5000, () => _wrap(nested));
+
+  final wrappedNested = _wrap(nested);
+  final unwrapNested = _timeNs(5000, () => _unwrap(wrappedNested));
+  final unwrapOld = _timeNs(5000, () => _unwrapViaReified(wrappedNested));
+
+  return <_Result>[
+    _Result('wrap a 5-key map', wrapSmall, 'ns', budget: 3000),
+    _Result('wrap a 50-key map', wrapWide, 'ns', budget: 20000),
+    _Result('wrap 50 rows x 8 fields', wrapNested / 1000, 'us', budget: 200),
+    _Result('unwrap 50 rows x 8 fields', unwrapNested / 1000, 'us',
+        budget: 200),
+    _Result(
+        r'unwrap the same via $reified (for contrast)', unwrapOld / 1000, 'us'),
   ];
 }
 

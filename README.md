@@ -337,6 +337,12 @@ screen's worth of logic and ruinous per list item or per frame. `marineford
 build` warns when a patch looks like it will be expensive, but the marking
 decision is yours.
 
+The arguments cost something too. A JSON payload is deep-copied into interpreter
+values on the way in and back out on the way out — around 390 ns for a five-key
+map, which disappears next to the crossing, but 34 µs for fifty rows of eight
+fields, which does not. Pass a patch the part of a response it needs rather than
+the whole response.
+
 ---
 
 ## What can cross the boundary

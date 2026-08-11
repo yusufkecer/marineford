@@ -74,7 +74,24 @@ abstract final class MarinefordJson {
   /// Needed on the return path too. A patch that hands back a rebuilt map — the
   /// response-normalizer pattern — returns interpreter values, and the app code
   /// downstream expects a real `Map<String, dynamic>`.
+  ///
+  /// Containers are descended into directly rather than through `$reified`.
+  /// `$reified` is itself recursive, so going through it built the entire plain
+  /// structure and then this walked the result and built it a second time —
+  /// twice the allocations for one conversion. Measured at 68µs against 34µs
+  /// for wrapping the same 50-row payload, an asymmetry with no reason to exist.
+  /// The `$Value` branch still catches everything else, including a bridged
+  /// object nested inside.
   static Object? unwrap(Object? value) {
+    if (value is $Map) {
+      return <Object?, Object?>{
+        for (final entry in value.$value.entries)
+          unwrap(entry.key): unwrap(entry.value),
+      };
+    }
+    if (value is $List) {
+      return <Object?>[for (final item in value.$value) unwrap(item)];
+    }
     if (value is $Value) return unwrap(value.$reified);
     if (value is Map) {
       return <Object?, Object?>{

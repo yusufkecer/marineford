@@ -116,6 +116,34 @@ class RuntimeOverride {
       expect(MarinefordJson.unwrap(MarinefordJson.wrap(original)), original);
     });
 
+    test('a plain container holding interpreter values still unwraps', () {
+      // Reachable when a patch builds a structure out of pieces that did not
+      // all come from the interpreter. `unwrap` descends into $Map and $List
+      // directly now instead of going through $reified, so the branch that
+      // catches a *plain* container full of $Values is the one that could
+      // quietly stop firing.
+      final mixed = <String, dynamic>{
+        'wrapped': MarinefordJson.wrap('value'),
+        'list': <dynamic>[MarinefordJson.wrap(1), MarinefordJson.wrap(null)],
+      };
+      expect(MarinefordJson.unwrap(mixed), <String, dynamic>{
+        'wrapped': 'value',
+        'list': <dynamic>[1, null],
+      });
+    });
+
+    test('a bridged object nested inside survives unwrapping', () {
+      // Not JSON, so `wrap` leaves it alone; `unwrap` has to leave it alone
+      // too, rather than mangling it on the way back out.
+      final sentinel = Object();
+      final round = MarinefordJson.unwrap(MarinefordJson.wrap(<String, dynamic>{
+        'plain': 1,
+        'opaque': sentinel,
+      }));
+      expect(round, isA<Map<Object?, Object?>>());
+      expect(identical((round! as Map)['opaque'], sentinel), isTrue);
+    });
+
     test('unwrapMap rejects a non-map so the caller can fall back', () {
       expect(MarinefordJson.unwrapMap(MarinefordJson.wrap(<dynamic>[1, 2])),
           isNull);
