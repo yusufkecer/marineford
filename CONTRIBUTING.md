@@ -111,6 +111,6 @@ keep the reason attached to it.
 - An S3-compatible `PublishTarget` (only `DirectoryTarget` exists today)
 - Reducing what `dart_eval` pulls into a shipped binary
 
-Before starting anything large, open an issue. The design decisions and their
-reasoning are in [plan.md](plan.md) — note that it is written in Turkish, as the
-working design document.
+Before starting anything large, open an issue. Most of the architecture is
+argued from measurements rather than taste, so it is worth asking what a change
+would do to the numbers in `bench/` before writing it.
