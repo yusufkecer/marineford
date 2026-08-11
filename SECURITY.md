@@ -1,4 +1,4 @@
-# Security policy
+# Security Policy
 
 marineford delivers code into installed apps. A flaw in it is not a bug in one
 app — it is a way into every app that trusts a given signing key. Please report
