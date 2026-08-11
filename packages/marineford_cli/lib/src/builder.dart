@@ -65,6 +65,8 @@ final class PatchBuilder {
       );
     }
 
+    _rejectPlatformImports(sources);
+
     final Program program;
     try {
       program = Compiler().compile(<String, Map<String, String>>{
@@ -164,4 +166,47 @@ final class PatchBuilder {
         'of Dart. Unsupported: mixins, extension methods, generators, '
         'typedefs, `late`, deferred imports, isolates.';
   }
+}
+
+/// Directives that pull in a platform library, ignoring comments and strings.
+///
+/// Anchored to the start of a line and to the `import`/`export` keyword,
+/// because that is where a directive has to be — Dart requires them before any
+/// declaration.
+final RegExp _platformImport = RegExp(
+  r'''^\s*(?:import|export)\s+['"](dart:(?:io|ffi|isolate|mirrors))['"]''',
+  multiLine: true,
+);
+
+/// Refuses a patch that imports a platform library.
+///
+/// marineford grants a patch no permissions at all, so every one of these calls
+/// either throws at runtime or, for the handful dart_eval forgot to gate, is
+/// refused by marineford's own sandbox. Either way the code is dead. Letting it
+/// compile means shipping a patch that silently does not do what it says, which
+/// is the single worst outcome for a system whose entire job is to fix things
+/// quietly.
+///
+/// A guard, not a boundary. Someone determined can spell an import so this
+/// misses it — Dart allows adjacent string literals in a URI, among other
+/// things — which is exactly why the enforcement lives in the runtime sandbox
+/// and not here. This exists so an honest mistake is caught by the person who
+/// made it, at build time, with a sentence explaining why.
+void _rejectPlatformImports(Map<String, String> sources) {
+  final offenders = <String>[];
+  sources.forEach((path, source) {
+    for (final match in _platformImport.allMatches(source)) {
+      offenders.add('$path imports ${match.group(1)}');
+    }
+  });
+  if (offenders.isEmpty) return;
+
+  throw CliException(
+    'a patch cannot use platform libraries:\n${offenders.map((o) => '  $o').join('\n')}',
+    hint: 'Patches are business logic. They run with no file system, network '
+        'or process access, so these calls would be refused at runtime and the '
+        'patch would silently do nothing. Move the platform work into the app, '
+        'mark the function above it with @patchable, and let the patch change '
+        'the logic instead.',
+  );
 }

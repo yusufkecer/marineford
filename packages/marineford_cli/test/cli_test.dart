@@ -120,6 +120,50 @@ void main() {
       expect(container.flags.has(MfpFlags.gzip), isTrue);
     });
 
+    test('a patch importing dart:io is refused before it compiles', () async {
+      // marineford grants a patch no permissions, so every dart:io call either
+      // throws at runtime or is refused by the sandbox. Letting it build means
+      // publishing a patch that silently does not do what it says — the worst
+      // possible outcome for a system whose job is to fix things quietly.
+      final project = await initProject();
+      writeIdRegistry();
+      writePatchPackage('''import 'dart:io';
+
+@RuntimeOverride('pkg:app/lib/api.dart#normalize', version: '>=1.0.0')
+Map normalize(Map raw) {
+  InternetAddress.lookup('leak.example.com');
+  return raw;
+}
+''');
+
+      await expectLater(
+        commands.build(project),
+        throwsA(isA<CliException>().having(
+            (CliException e) => '${e.message} ${e.hint}',
+            'message',
+            allOf(contains('dart:io'), contains('platform')))),
+      );
+    });
+
+    test('a patch that stays away from platform libraries still builds',
+        () async {
+      // The other half: the check must not fire on ordinary code that happens
+      // to contain the word `import` or the string `dart:io` somewhere.
+      final project = await initProject();
+      writeIdRegistry();
+      writePatchPackage('''
+@RuntimeOverride('pkg:app/lib/api.dart#normalize', version: '>=1.0.0')
+Map normalize(Map raw) {
+  // Mentions dart:io in a comment, and 'import' in a string.
+  final note = 'we do not import anything';
+  if (note.length > 0) { return raw; }
+  return raw;
+}
+''');
+
+      expect((await commands.build(project)).existsSync(), isTrue);
+    });
+
     test('the packed patch verifies against the project key', () async {
       final project = await initProject();
       writeIdRegistry();
