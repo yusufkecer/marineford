@@ -1,3 +1,5 @@
+import 'package:analyzer/dart/analysis/utilities.dart';
+import 'package:analyzer/diagnostic/diagnostic.dart';
 import 'package:build_test/build_test.dart';
 import 'package:logging/logging.dart';
 import 'package:marineford_gen/builder.dart';
@@ -22,6 +24,28 @@ final class PatchableService {
   final List<String> exclude;
 }
 ''';
+
+/// Parses [source] as Dart, failing the test with the analyzer's own message.
+///
+/// The old check counted braces, which is why a generated `super.foo()` call
+/// against an abstract method and a subclass with no usable constructor both
+/// sailed through: both are perfectly balanced and neither compiles.
+void expectValidDart(String source) {
+  final result = parseString(content: source, throwIfDiagnostics: false);
+  final errors =
+      result.errors.where((e) => e.severity == Severity.error).toList();
+  expect(errors, isEmpty,
+      reason: 'generated code does not parse: ${errors.join('; ')}');
+}
+
+/// Collapses runs of whitespace, so an assertion about generated code does not
+/// also assert about where the formatter chose to wrap it.
+String collapse(String source) => source.replaceAll(RegExp(r'\s+'), ' ');
+
+/// Turns a generated part file into something that stands alone well enough to
+/// parse, by dropping the `part of` directive.
+String asLibrary(String output, [String extra = '']) => 'library x;\n$extra\n'
+    '${output.replaceFirst("part of 'pricing.dart';", '')}';
 
 const _runtimeStub = r'''
 final class Patch {
@@ -102,6 +126,8 @@ part 'pricing.marineford.dart';
 ''';
 
 void main() {
+  _gaps();
+
   group('@patchable functions', () {
     test('generates a public wrapper around the private implementation',
         () async {
@@ -113,7 +139,9 @@ int _double(int value) => value * 2;
       expect(output, contains('int double(int value) {'));
       expect(
           output, contains("Patch.slot(r'pkg:app/lib/pricing.dart#double')"));
-      expect(output, contains('Patch.invoke1(_s, value,'),
+      // Whitespace-insensitive: the formatter wraps long calls, and an
+      // assertion that breaks on line width is testing the formatter.
+      expect(collapse(output), contains('Patch.invoke1( _mfSlot, value,'),
           reason: 'a non-nullable int is passed raw');
       expect(output, contains('return _double(value);'),
           reason: 'the fallback must call the original');
@@ -150,7 +178,7 @@ $_imports
 @patchable
 Map<String, dynamic> _normalize(Map<String, dynamic> raw) => raw;
 ''');
-      expect(output, contains('MarinefordJson.unwrapMap(_r)'));
+      expect(output, contains('MarinefordJson.unwrapMap(_mfResult)'));
     });
 
     test('handles a nullable return without confusing it with no patch',
@@ -160,7 +188,7 @@ $_imports
 @patchable
 String? _maybe(int v) => null;
 ''');
-      expect(output, contains('identical(_r, patchedNull)'),
+      expect(output, contains('identical(_mfResult, patchedNull)'),
           reason: 'a patch returning null must be distinguishable');
     });
 
@@ -249,10 +277,11 @@ class ServiceBase {
   int b(int v) => v;
 }
 ''');
-      expect(output, contains('if (_generation == Patch.generation) return;'));
-      expect(output, contains('int? _s0;'));
-      expect(output, contains('int? _s1;'));
-      expect(output, contains('_sync();'));
+      expect(
+          output, contains('if (_mfGeneration == Patch.generation) return;'));
+      expect(output, contains('int? _mfSlot0;'));
+      expect(output, contains('int? _mfSlot1;'));
+      expect(output, contains('_mfSync();'));
     });
 
     test('exclude keeps a method off the boundary', () async {
@@ -321,10 +350,174 @@ class RulesBase {
   void audit(String message) {}
 }
 ''');
-      // Balanced braces is a cheap proxy for "the template did not tear".
-      expect('{'.allMatches(output).length, '}'.allMatches(output).length);
+      expectValidDart(asLibrary(output));
       expect(output, contains('void audit(String message) {'));
-      expect(output, contains('MarinefordJson.unwrapList(_r)'));
+      expect(output, contains('MarinefordJson.unwrapList(_mfResult)'));
     });
+  });
+}
+
+/// Gaps the review named.
+void _gaps() {
+  group('abstract methods', () {
+    test('an abstract method is a build error, not uncompilable output',
+        () async {
+      // The shim falls back to `super`, and an abstract method has nothing
+      // there. The old generator emitted the call anyway and the generated file
+      // simply did not compile.
+      final error = await generateError('''
+$_imports
+@PatchableService()
+abstract class RulesBase {
+  int total(int a);
+  int other(int a) => a;
+}
+''');
+      expect(error, contains('abstract'));
+      expect(error, contains('super'));
+    });
+
+    test('excluding the abstract method makes it work', () async {
+      final output = await generate('''
+$_imports
+@PatchableService(exclude: ['total'])
+abstract class RulesBase {
+  int total(int a);
+  int other(int a) => a;
+}
+''');
+      expect(output, contains('int other(int a) {'));
+      expect(output, isNot(contains('super.total')));
+    });
+  });
+
+  group('constructors', () {
+    test('an unnamed constructor with dependencies is forwarded', () async {
+      // Without this @PatchableService cannot be used on any service that takes
+      // a dependency, which is most of them.
+      final output = await generate('''
+$_imports
+@PatchableService()
+class RulesBase {
+  RulesBase(this.rate);
+  final int rate;
+  int total(int a) => a * rate;
+}
+''');
+      expect(output, contains('Rules(super.rate) : super();'));
+      expectValidDart(asLibrary(output, '''
+class RulesBase {
+  RulesBase(this.rate);
+  final int rate;
+  int total(int a) => a * rate;
+}
+'''));
+    });
+
+    test('named parameters are forwarded with their required-ness', () async {
+      final output = await generate('''
+$_imports
+@PatchableService()
+class RulesBase {
+  RulesBase({required this.rate, this.label = ''});
+  final int rate;
+  final String label;
+  int total(int a) => a * rate;
+}
+''');
+      expect(output, contains('required super.rate'));
+      expect(output, contains('super.label'));
+    });
+
+    test('a named constructor is forwarded under its own name', () async {
+      final output = await generate('''
+$_imports
+@PatchableService()
+class RulesBase {
+  RulesBase.withRate(this.rate);
+  final int rate;
+  int total(int a) => a * rate;
+}
+''');
+      expect(
+          output, contains('Rules.withRate(super.rate) : super.withRate();'));
+    });
+  });
+
+  group('misplaced annotations', () {
+    test('@patchable on a class is a build error', () async {
+      // The most natural mistake there is. It used to generate nothing and say
+      // nothing.
+      final error = await generateError('''
+$_imports
+@patchable
+class Rules {
+  int total(int a) => a;
+}
+''');
+      expect(error, contains('top-level functions'));
+      expect(error, contains('@PatchableService'));
+    });
+
+    test('@patchable on a method is a build error', () async {
+      final error = await generateError('''
+$_imports
+class Rules {
+  @patchable
+  int total(int a) => a;
+}
+''');
+      expect(error, contains('top-level functions'));
+    });
+  });
+
+  group('exclude', () {
+    test('a misspelled exclusion is a build error', () async {
+      // Silently ignoring it marks the hot path the developer was trying to
+      // keep off the boundary — the opposite of what they asked for.
+      final error = await generateError('''
+$_imports
+@PatchableService(exclude: ['totl'])
+class RulesBase {
+  int total(int a) => a;
+  int other(int a) => a;
+}
+''');
+      expect(error, contains('totl'));
+    });
+  });
+
+  group('duplicate ids', () {
+    test('two functions with the same explicit id are a build error', () async {
+      final error = await generateError('''
+$_imports
+@Patchable(id: 'same')
+int _a(int v) => v;
+
+@Patchable(id: 'same')
+int _b(int v) => v;
+''');
+      expect(error, contains('share the dispatch id'));
+    });
+  });
+
+  group('shim variable names cannot collide with parameters', () {
+    test('a parameter named like the shim locals still works', () async {
+      final output = await generate('''
+$_imports
+@patchable
+int _f(int _mfSlot, int _mfResult) => _mfSlot;
+''');
+      // Not a great parameter name, but the generator must not produce code
+      // that shadows its own locals.
+      expectValidDart(
+          'library x;\n${output.replaceFirst("part of 'pricing.dart';", '')}'
+          '\nint _f(int a, int b) => a;');
+    });
+  });
+
+  test('the contract version is recorded in the ABI marker', () async {
+    final output = await generate('$_imports\n@patchable\nint _a(int v) => v;');
+    expect(output, contains('"contract":'));
   });
 }

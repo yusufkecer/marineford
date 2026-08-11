@@ -4,7 +4,7 @@ import 'package:build/build.dart';
 import 'package:glob/glob.dart';
 
 import 'abi.dart';
-import 'shim_generator.dart' show abiMarker;
+import 'shim_generator.dart' show abiMarker, kShimContractVersion;
 
 /// Collects every shim in the package into one ABI fingerprint and id registry.
 ///
@@ -29,6 +29,7 @@ final class AbiAggregator implements Builder {
   @override
   Future<void> build(BuildStep buildStep) async {
     final records = <Map<String, Object?>>[];
+    var contract = kShimContractVersion;
     await for (final input
         in buildStep.findAssets(Glob('**/*.marineford.dart'))) {
       for (final line in const LineSplitter()
@@ -36,13 +37,33 @@ final class AbiAggregator implements Builder {
         final marker = line.indexOf(abiMarker);
         if (marker < 0) continue;
         final decoded = jsonDecode(line.substring(marker + abiMarker.length));
-        if (decoded is Map<String, Object?>) records.add(decoded);
+        if (decoded is! Map<String, Object?>) continue;
+        final declared = decoded['contract'];
+        if (declared is int) {
+          contract = declared;
+          continue;
+        }
+        records.add(decoded);
       }
     }
 
     records.sort((a, b) => '${a['id']}'.compareTo('${b['id']}'));
 
-    final abi = AbiBuilder();
+    final seen = <String>{};
+    for (final record in records) {
+      final id = '${record['id']}';
+      if (!seen.add(id)) {
+        // Two files in the same package cannot see each other's ids, so this is
+        // the only place a collision across libraries is visible. Left
+        // undetected, a patch overriding the id reaches whichever shim the
+        // runtime registered last — silently, and differently between builds.
+        throw StateError('two patchable functions share the dispatch id "$id". '
+            'One of them is at ${record['origin']}. Give one an explicit id '
+            'with @Patchable(id: ...).');
+      }
+    }
+
+    final abi = AbiBuilder(contractVersion: contract);
     for (final record in records) {
       abi.add(
         id: '${record['id']}',

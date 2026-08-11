@@ -17,6 +17,23 @@ import 'types.dart';
 /// contains. Carrying the data in the same file makes that impossible.
 const String abiMarker = 'MARINEFORD-ABI: ';
 
+/// Version of the contract between generated shims and the runtime.
+///
+/// Folded into the fingerprint. The shims call `Patch.invokeN` with a specific
+/// argument shape and unwrap the result a specific way; if that contract
+/// changes, patches built against the old one are not safe to load even though
+/// every user-visible signature is identical. Bump this whenever the emitted
+/// call sequence changes.
+const int kShimContractVersion = 1;
+
+/// Local variable names the generated shims use.
+///
+/// Prefixed rather than plain `_s` and `_r`, which a user parameter can
+/// legitimately be called — and then the shim shadows it and either fails to
+/// compile or, worse, compiles against the wrong variable.
+const String _slotVar = '_mfSlot';
+const String _resultVar = '_mfResult';
+
 /// One patchable function, as recorded for the ABI fingerprint and the id
 /// registry.
 final class ShimRecord {
@@ -40,7 +57,7 @@ final class ShimRecord {
   /// Human-readable location, for `marineford doctor`.
   final String origin;
 
-  /// JSON form written to the side output the ABI builder aggregates.
+  /// JSON form embedded in the generated file.
   Map<String, Object?> toJson() => <String, Object?>{
         'id': id,
         'params': parameterTypes,
@@ -52,10 +69,10 @@ final class ShimRecord {
 /// Generates dispatch shims for `@patchable` and `@PatchableService`.
 ///
 /// The shims are the whole performance story. Each one is a single static field
-/// read against null before anything else happens, so a marked function that is
-/// not currently patched costs ~2.4ns against ~1.7ns unmarked. Everything else
-/// — building an argument list, looking up a map, parsing a version constraint —
-/// happens only once a patch is actually live.
+/// read away from doing nothing, so a marked function that is not currently
+/// patched costs a few nanoseconds. Everything else — building an argument
+/// list, looking up a map, parsing a version constraint — happens only once a
+/// patch is actually live.
 final class ShimGenerator extends Generator {
   /// Creates a [ShimGenerator].
   ShimGenerator();
@@ -63,42 +80,77 @@ final class ShimGenerator extends Generator {
   static const _patchable = TypeChecker.typeNamed(Patchable);
   static const _service = TypeChecker.typeNamed(PatchableService);
 
-  /// Everything generated during this build, for the ABI side output.
-  final List<ShimRecord> records = <ShimRecord>[];
-
   @override
   Future<String?> generate(LibraryReader library, BuildStep buildStep) async {
-    records.clear();
+    final records = <ShimRecord>[];
     final buffer = StringBuffer();
     final libraryId = _libraryId(buildStep.inputId);
 
     for (final element in library.allElements) {
-      if (element is TopLevelFunctionElement &&
-          _patchable.hasAnnotationOfExact(element)) {
-        buffer.writeln(_generateFunction(element, libraryId));
-      } else if (element is ClassElement &&
-          _service.hasAnnotationOfExact(element)) {
-        buffer.writeln(_generateService(element, libraryId, library));
+      if (element is TopLevelFunctionElement) {
+        if (_patchable.hasAnnotationOfExact(element)) {
+          buffer.writeln(_generateFunction(element, libraryId, records));
+        }
+        continue;
+      }
+      if (element is ClassElement) {
+        // A misplaced @patchable is a build error, not a no-op. The analyzer
+        // catches most of these first via @Target, but a class in a library
+        // that predates the annotation update would otherwise generate nothing
+        // and say nothing — the loudest possible silence.
+        _rejectMisplaced(element);
+        for (final method in element.methods) {
+          _rejectMisplaced(method);
+        }
+        if (_service.hasAnnotationOfExact(element)) {
+          buffer.writeln(_generateService(element, libraryId, records));
+        }
       }
     }
 
     if (buffer.isEmpty) return null;
 
-    // The ABI records ride along inside the generated file as machine-readable
-    // comments. The aggregating step reads them back out rather than resolving
-    // every library a second time — and because they live in the same file as
-    // the shims they describe, the two can never drift apart.
+    _rejectDuplicates(records);
+
     final marked = StringBuffer();
     for (final record in records) {
       marked.writeln('// $abiMarker${jsonEncode(record.toJson())}');
     }
     marked
+      ..writeln('// $abiMarker'
+          '{"contract":$kShimContractVersion}')
       ..writeln()
       ..write(buffer);
     return marked.toString();
   }
 
-  String _generateFunction(TopLevelFunctionElement element, String libraryId) {
+  void _rejectMisplaced(Element element) {
+    if (!_patchable.hasAnnotationOfExact(element)) return;
+    throw InvalidGenerationSourceError(
+      '@patchable only applies to top-level functions. A class or a method '
+      'annotated with it generates nothing at all, which is worse than an '
+      'error. Use @PatchableService on the class instead.',
+      element: element,
+    );
+  }
+
+  void _rejectDuplicates(List<ShimRecord> records) {
+    final seen = <String, String>{};
+    for (final record in records) {
+      final previous = seen[record.id];
+      if (previous != null) {
+        throw InvalidGenerationSourceError(
+          'two patchable functions share the dispatch id "${record.id}": '
+          '$previous and ${record.origin}. A patch overriding it would reach '
+          'whichever the runtime happened to register last.',
+        );
+      }
+      seen[record.id] = record.origin;
+    }
+  }
+
+  String _generateFunction(TopLevelFunctionElement element, String libraryId,
+      List<ShimRecord> records) {
     final privateName = element.name;
     if (privateName == null || !privateName.startsWith('_')) {
       throw InvalidGenerationSourceError(
@@ -133,7 +185,7 @@ ${_body(id, signature, '$privateName(${signature.forwarding})')}
   }
 
   String _generateService(
-      ClassElement element, String libraryId, LibraryReader library) {
+      ClassElement element, String libraryId, List<ShimRecord> records) {
     final annotation = _service.firstAnnotationOfExact(element)!;
     final reader = ConstantReader(annotation);
     final baseName = element.name;
@@ -161,13 +213,44 @@ ${_body(id, signature, '$privateName(${signature.forwarding})')}
         value.toStringValue() ?? '',
     };
 
-    final methods = <MethodElement>[
+    final declared = <String>{
       for (final method in element.methods)
-        if (!method.isStatic &&
-            !(method.name?.startsWith('_') ?? true) &&
-            !excluded.contains(method.name))
-          method,
-    ];
+        if (method.name != null) method.name!,
+    };
+    final unmatched = excluded.difference(declared);
+    if (unmatched.isNotEmpty) {
+      throw InvalidGenerationSourceError(
+        '`$baseName` has no method named ${unmatched.map((n) => '"$n"').join(', ')}, '
+        'but @PatchableService excludes it. A misspelled exclusion leaves the '
+        'method you meant to keep off the boundary firmly on it.',
+        element: element,
+      );
+    }
+
+    final abstractMethods = <String>[];
+    final methods = <MethodElement>[];
+    for (final method in element.methods) {
+      final name = method.name;
+      if (name == null || method.isStatic || name.startsWith('_')) continue;
+      if (excluded.contains(name)) continue;
+      if (method.isAbstract) {
+        abstractMethods.add(name);
+        continue;
+      }
+      methods.add(method);
+    }
+
+    if (abstractMethods.isNotEmpty) {
+      throw InvalidGenerationSourceError(
+        '`$baseName` declares abstract method'
+        '${abstractMethods.length == 1 ? '' : 's'} '
+        '${abstractMethods.map((n) => '"$n"').join(', ')}. A shim falls back to '
+        '`super`, and there is nothing there to call. Give them bodies, or '
+        'list them in @PatchableService(exclude: [...]) and implement them in '
+        'a subclass.',
+        element: element,
+      );
+    }
 
     if (methods.isEmpty) {
       throw InvalidGenerationSourceError(
@@ -196,13 +279,13 @@ ${_body(id, signature, '$privateName(${signature.forwarding})')}
         origin: '$libraryId $generatedName.$name()',
       ));
 
-      fields.writeln('  int? _s$i;');
-      sync.writeln("    _s$i = Patch.slot(r'$id');");
+      fields.writeln('  int? _mfSlot$i;');
+      sync.writeln("    _mfSlot$i = Patch.slot(r'$id');");
       overrides.writeln('''
   @override
   ${signature.returnDisplay} $name(${signature.declaration}) {
-    _sync();
-${_body(id, signature, 'super.$name(${signature.forwarding})', slotExpression: '_s$i')}
+    _mfSync();
+${_body(id, signature, 'super.$name(${signature.forwarding})', slotExpression: '_mfSlot$i')}
   }
 ''');
     }
@@ -213,7 +296,7 @@ ${_body(id, signature, 'super.$name(${signature.forwarding})', slotExpression: '
 /// Use this class at your call sites. Each method dispatches to a patch when
 /// one is live and to `$baseName` otherwise.
 class $generatedName extends $baseName {
-  int _generation = -1;
+${_constructors(element, generatedName, baseName)}  int _mfGeneration = -1;
 ${fields.toString().trimRight()}
 
   /// Refreshes the cached slots when a patch is activated or removed.
@@ -221,15 +304,54 @@ ${fields.toString().trimRight()}
   /// Comparing an int is cheaper than a map lookup, and this runs on every
   /// call, so the cheap version is the one that matters.
   @pragma('vm:prefer-inline')
-  void _sync() {
-    if (_generation == Patch.generation) return;
-    _generation = Patch.generation;
+  void _mfSync() {
+    if (_mfGeneration == Patch.generation) return;
+    _mfGeneration = Patch.generation;
 ${sync.toString().trimRight()}
   }
 
 ${overrides.toString().trimRight()}
 }
 ''';
+  }
+
+  /// Forwards the base class's constructors.
+  ///
+  /// Without this the generated class only has an implicit no-argument
+  /// constructor, so `@PatchableService` cannot be used on any service that
+  /// takes a dependency — which is most of them.
+  String _constructors(
+      ClassElement element, String generatedName, String baseName) {
+    final buffer = StringBuffer();
+    for (final constructor in element.constructors) {
+      if (constructor.isFactory) continue;
+      final name = constructor.name;
+      // Analyzer names the unnamed constructor `new`.
+      final isUnnamed = name == null || name.isEmpty || name == 'new';
+      final suffix = isUnnamed ? '' : '.$name';
+
+      final positional = <String>[];
+      final named = <String>[];
+      for (final parameter in constructor.formalParameters) {
+        final parameterName = parameter.name;
+        if (parameterName == null) continue;
+        if (parameter.isNamed) {
+          named.add('${parameter.isRequired ? 'required ' : ''}'
+              'super.$parameterName');
+        } else if (parameter.isOptionalPositional) {
+          positional.add('super.$parameterName');
+        } else {
+          positional.add('super.$parameterName');
+        }
+      }
+
+      final parameters = <String>[
+        ...positional,
+        if (named.isNotEmpty) '{${named.join(', ')}}',
+      ].join(', ');
+      buffer.writeln('  $generatedName$suffix($parameters) : super$suffix();');
+    }
+    return buffer.isEmpty ? '' : '${buffer.toString().trimRight()}\n\n';
   }
 
   /// The shared shim body: check, dispatch, unwrap, fall back.
@@ -240,18 +362,26 @@ ${overrides.toString().trimRight()}
     // top-level function looks it up here. Either way the hot path ends up as
     // one read and one null check.
     lines.writeln(slotExpression == null
-        ? "    final _s = Patch.slot(r'$id');"
-        : '    final _s = $slotExpression;');
-    lines.writeln('    if (_s != null) {');
-    lines.writeln('      final _r = ${signature.invocation('_s', id)};');
+        ? "    final $_slotVar = Patch.slot(r'$id');"
+        : '    final $_slotVar = $slotExpression;');
+    lines.writeln('    if ($_slotVar != null) {');
+    lines.writeln(
+        '      final $_resultVar = ${signature.invocation(_slotVar, id)};');
     if (signature.returnsVoid) {
-      lines.writeln('      if (_r != null) return;');
+      lines.writeln('      if ($_resultVar != null) return;');
     } else if (signature.returnIsNullable) {
-      lines.writeln('      if (identical(_r, patchedNull)) return null;');
-      lines.writeln('      if (_r != null) return ${signature.unwrap('_r')};');
+      lines.writeln(
+          '      if (identical($_resultVar, patchedNull)) return null;');
+      lines.writeln('      if ($_resultVar != null) {');
+      lines.writeln('        return ${signature.unwrap(_resultVar)};');
+      lines.writeln('      }');
     } else {
-      lines.writeln('      if (_r != null && !identical(_r, patchedNull)) {');
-      lines.writeln('        return ${signature.unwrap('_r')};');
+      // A patch that returns null where the signature says non-null is a bug in
+      // the patch. Falling through to the original is the safe reading: the
+      // alternative is a null that the caller's type system says cannot happen.
+      lines.writeln('      if ($_resultVar != null && '
+          '!identical($_resultVar, patchedNull)) {');
+      lines.writeln('        return ${signature.unwrap(_resultVar)};');
       lines.writeln('      }');
     }
     lines.writeln('    }');
@@ -295,7 +425,13 @@ final class _Signature {
 
     for (final parameter in parameters) {
       final name = parameter.name;
-      if (name == null) continue;
+      if (name == null) {
+        throw InvalidGenerationSourceError(
+          '`$id` has an unnamed parameter, which the generator cannot forward '
+          'without changing the function\'s arity.',
+          element: element,
+        );
+      }
       if (parameter.isNamed || parameter.isOptionalPositional) {
         throw InvalidGenerationSourceError(
           'Optional and named parameters are not supported on a patchable '
@@ -313,7 +449,7 @@ final class _Signature {
       }
       declaration.add('${parameter.type.getDisplayString()} $name');
       forwarding.add(name);
-      canonical.add(parameter.type.getDisplayString());
+      canonical.add(canonicalType(parameter.type));
       arguments.add(argumentExpression(name, verdict));
     }
 
@@ -332,10 +468,11 @@ final class _Signature {
       declaration: declaration.join(', '),
       forwarding: forwarding.join(', '),
       canonicalTypes: canonical,
-      canonicalReturn: returnType.getDisplayString(),
+      canonicalReturn: canonicalType(returnType),
       returnDisplay: returnType.getDisplayString(),
       returnsVoid: returnsVoid,
-      returnIsNullable: returnType.getDisplayString().endsWith('?'),
+      returnIsNullable:
+          returnType.nullabilitySuffix.toString().contains('question'),
       arguments: arguments,
       returnType: returnType,
     );

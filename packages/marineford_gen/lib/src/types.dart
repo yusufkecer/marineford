@@ -127,3 +127,31 @@ String returnExpression(String expression, DartType type) {
   if (type is DynamicType) return 'MarinefordJson.unwrap($expression)';
   return '$expression as $display';
 }
+
+/// A type name stable enough to hash into the ABI fingerprint.
+///
+/// `getDisplayString` renders a typedef by its alias, so swapping what
+/// `UserId` points at — `String` today, `int` tomorrow — leaves the fingerprint
+/// unchanged while every patch built against the old meaning becomes wrong. It
+/// also renders two different `Result` classes from two libraries identically.
+///
+/// This resolves the alias and qualifies the name with the library that
+/// declares it, so both cases change the hash.
+String canonicalType(DartType type) {
+  final alias = type.alias;
+  if (alias != null) {
+    // Hash what the alias means, not what it is called.
+    return canonicalType(alias.element.aliasedType);
+  }
+
+  final element = type.element;
+  final buffer = StringBuffer();
+  if (element != null) {
+    final uri = element.library?.uri;
+    if (uri != null && !uri.isScheme('dart')) {
+      buffer.write('$uri::');
+    }
+  }
+  buffer.write(type.getDisplayString());
+  return buffer.toString();
+}

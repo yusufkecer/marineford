@@ -15,6 +15,18 @@ import 'package:crypto/crypto.dart';
 /// loads, and then throws somewhere unrelated. The fingerprint turns that into
 /// a patch that is simply never selected.
 final class AbiBuilder {
+  /// Creates an [AbiBuilder] for a given generator/runtime contract version.
+  AbiBuilder({this.contractVersion = 1});
+
+  /// Version of the calling convention the shims were generated against.
+  ///
+  /// Part of the hash. Two builds can expose byte-identical signatures and
+  /// still be incompatible if the generated call sequence changed underneath —
+  /// the argument shape handed to the interpreter, or the way a result is
+  /// unwrapped. Without this, a patch built before such a change loads happily
+  /// into a build after it.
+  final int contractVersion;
+
   final List<String> _entries = <String>[];
 
   /// Records one patchable function.
