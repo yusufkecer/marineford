@@ -104,16 +104,15 @@ final class MarinefordProject {
     if (appId is! String || appId.isEmpty) {
       throw CliException('${file.path} is missing `app_id`');
     }
-    final budget = parsed['size_budget_kb'];
 
     return MarinefordProject(
       appId: appId,
       root: root,
-      channel: parsed['channel'] as String? ?? 'prod',
-      baseUrl: parsed['base_url'] as String?,
-      patchPackage: parsed['patch_package'] as String? ?? 'patch',
-      appPackage: parsed['app_package'] as String? ?? '.',
-      sizeBudgetBytes: budget is int ? budget * 1024 : 256 * 1024,
+      channel: _optionalString(parsed, 'channel', file) ?? 'prod',
+      baseUrl: _optionalString(parsed, 'base_url', file),
+      patchPackage: _optionalString(parsed, 'patch_package', file) ?? 'patch',
+      appPackage: _optionalString(parsed, 'app_package', file) ?? '.',
+      sizeBudgetBytes: _budgetBytes(parsed, file),
     );
   }
 
@@ -149,4 +148,34 @@ final class MarinefordIdRegistry {
 
   /// Every dispatch id the app exposes.
   final Set<String> ids;
+}
+
+/// Reads an optional string, refusing anything else.
+///
+/// A raw `as String?` cast turns a typo like `channel: 3` into a bare
+/// `TypeError` with no file name in it. Configuration mistakes deserve a
+/// sentence naming the file and the key.
+String? _optionalString(Map<Object?, Object?> yaml, String key, File file) {
+  final value = yaml[key];
+  if (value == null) return null;
+  if (value is! String) {
+    throw CliException('${file.path}: `$key` must be a string, got '
+        '${value.runtimeType}');
+  }
+  return value;
+}
+
+/// Reads `size_budget_kb`, refusing a value that is present but unusable.
+///
+/// Falling back to the default when the key is the wrong type hides the
+/// mistake: the developer sets a budget, the budget is silently ignored, and
+/// they conclude the check does not work.
+int _budgetBytes(Map<Object?, Object?> yaml, File file) {
+  final value = yaml['size_budget_kb'];
+  if (value == null) return 256 * 1024;
+  if (value is! int || value <= 0) {
+    throw CliException('${file.path}: `size_budget_kb` must be a positive '
+        'integer, got "$value"');
+  }
+  return value * 1024;
 }

@@ -116,7 +116,7 @@ void main() {
 
       // What was written must be readable by the device-side parser.
       final container = MfpContainer.parse(file.readAsBytesSync());
-      expect(container.abi, _abi);
+      expect(container.abi, AbiFingerprint.parse(_abi));
       expect(container.flags.has(MfpFlags.gzip), isTrue);
     });
 
@@ -215,7 +215,7 @@ int normalize(int v) { return v; }
       // dart_eval defaults the constraint to its own version, so an override
       // without one never fires. Silence here would be a patch that publishes
       // cleanly and does nothing.
-      expect(console.text, contains('no `version:` constraint'));
+      expect(console.text, contains('no usable version constraint'));
     });
 
     test('warns about a large interpreted loop', () async {
@@ -258,29 +258,32 @@ int normalize(int v) {
         project,
         target: targetFor('prod'),
         channel: 'prod',
-        appVersionMin: Version.parse('1.0.0'),
-        appVersionMax: Version.parse('1.9.9'),
+        appVersions: VersionConstraint.parse('>=1.0.0 <=1.9.9'),
       );
 
       final dist = Directory(p.join(root.path, 'dist', 'prod'));
       final manifestBytes =
           File(p.join(dist.path, 'manifest.json')).readAsBytesSync();
-      final manifest = PatchManifest.parse(utf8.decode(manifestBytes));
+      final manifest = SignedManifest.parse(manifestBytes).manifest;
 
       expect(manifest.appId, 'com.example.app');
       expect(manifest.patches.single.number, 1);
-      expect(manifest.patches.single.abi, _abi);
+      expect(manifest.patches.single.abi, AbiFingerprint.parse(_abi));
       expect(File(p.join(dist.path, '1.mfp')).existsSync(), isTrue);
+
+      // One file, not two. A separate .sig left a window in which the new
+      // manifest was up and the old signature was not.
+      expect(
+          File(p.join(dist.path, 'manifest.json.sig')).existsSync(), isFalse);
 
       final publicKey = File(p.join(root.path, '.marineford', 'signing.pub'))
           .readAsStringSync();
-      final signature =
-          File(p.join(dist.path, 'manifest.json.sig')).readAsBytesSync();
+      final signed = SignedManifest.parse(manifestBytes);
       expect(
         await PatchVerifier.fromBase64(publicKey)
-            .verify(manifestBytes, signature),
+            .verify(signed.signedBytes, signed.signature),
         isTrue,
-        reason: 'the signature must cover the exact bytes that were written',
+        reason: 'the signature must cover the exact bytes that were signed',
       );
     });
 
@@ -290,13 +293,13 @@ int normalize(int v) {
         project,
         target: targetFor('prod'),
         channel: 'prod',
-        appVersionMin: Version.parse('1.0.0'),
-        appVersionMax: Version.parse('1.9.9'),
+        appVersions: VersionConstraint.parse('>=1.0.0 <=1.9.9'),
       );
 
       final dist = p.join(root.path, 'dist', 'prod');
-      final manifest = PatchManifest.parse(
-          File(p.join(dist, 'manifest.json')).readAsStringSync());
+      final manifest = SignedManifest.parse(
+              File(p.join(dist, 'manifest.json')).readAsBytesSync())
+          .manifest;
       final bytes = File(p.join(dist, '1.mfp')).readAsBytesSync();
 
       expect(manifest.patches.single.sha256, sha256Hex(bytes));
@@ -310,13 +313,13 @@ int normalize(int v) {
           project,
           target: targetFor('prod'),
           channel: 'prod',
-          appVersionMin: Version.parse('1.0.0'),
-          appVersionMax: Version.parse('1.9.9'),
+          appVersions: VersionConstraint.parse('>=1.0.0 <=1.9.9'),
         );
       }
-      final manifest = PatchManifest.parse(
-          File(p.join(root.path, 'dist', 'prod', 'manifest.json'))
-              .readAsStringSync());
+      final manifest = SignedManifest.parse(
+              File(p.join(root.path, 'dist', 'prod', 'manifest.json'))
+                  .readAsBytesSync())
+          .manifest;
       expect(manifest.patches.map((e) => e.number), [3, 2, 1]);
     });
 
@@ -325,8 +328,7 @@ int normalize(int v) {
       await commands.publish(project,
           target: targetFor('beta'),
           channel: 'beta',
-          appVersionMin: Version.parse('1.0.0'),
-          appVersionMax: Version.parse('1.9.9'));
+          appVersions: VersionConstraint.parse('>=1.0.0 <=1.9.9'));
 
       expect(
           File(p.join(root.path, 'dist', 'beta', 'manifest.json')).existsSync(),
@@ -339,23 +341,23 @@ int normalize(int v) {
     test('refuses to publish into another app\'s channel', () async {
       final project = await readyProject();
       final target = targetFor('prod');
-      await target.put(
-        'manifest.json',
-        utf8.encode(jsonEncode({
-          'schema': 1,
-          'app': 'com.other.app',
-          'channel': 'prod',
-          'generatedAt': '2026-08-10T00:00:00Z',
-          'patches': <Object?>[],
-        })),
-      );
+      final otherSigner = await PatchSigner.generate();
+      final foreign = SignedManifest.bytesToSign(PatchManifest(
+        schema: 1,
+        appId: 'com.other.app',
+        channel: 'prod',
+        sequence: 1,
+        generatedAt: DateTime.utc(2026, 8, 10),
+        patches: const <PatchEntry>[],
+      ));
+      await target.put('manifest.json',
+          SignedManifest.encode(foreign, await otherSigner.sign(foreign)));
 
       await expectLater(
         commands.publish(project,
             target: target,
             channel: 'prod',
-            appVersionMin: Version.parse('1.0.0'),
-            appVersionMax: Version.parse('1.9.9')),
+            appVersions: VersionConstraint.parse('>=1.0.0 <=1.9.9')),
         throwsA(isA<CliException>()
             .having((e) => e.message, 'message', contains('com.other.app'))),
       );
@@ -367,8 +369,7 @@ int normalize(int v) {
         commands.publish(project,
             target: targetFor('prod'),
             channel: 'prod',
-            appVersionMin: Version.parse('1.0.0'),
-            appVersionMax: Version.parse('1.9.9')),
+            appVersions: VersionConstraint.parse('>=1.0.0 <=1.9.9')),
         throwsA(isA<CliException>()
             .having((e) => e.hint, 'hint', contains('marineford build'))),
       );
@@ -379,17 +380,17 @@ int normalize(int v) {
       await commands.publish(project,
           target: targetFor('prod'),
           channel: 'prod',
-          appVersionMin: Version.parse('1.0.0'),
-          appVersionMax: Version.parse('1.9.9'),
+          appVersions: VersionConstraint.parse('>=1.0.0 <=1.9.9'),
           rollout: 0.1);
       expect(console.text, contains('rollout 10%'));
 
       await commands.rollout(project,
           target: targetFor('prod'), channel: 'prod', number: 1, fraction: 1.0);
 
-      final manifest = PatchManifest.parse(
-          File(p.join(root.path, 'dist', 'prod', 'manifest.json'))
-              .readAsStringSync());
+      final manifest = SignedManifest.parse(
+              File(p.join(root.path, 'dist', 'prod', 'manifest.json'))
+                  .readAsBytesSync())
+          .manifest;
       expect(manifest.patches.single.rollout, 1.0);
     });
 
@@ -398,8 +399,7 @@ int normalize(int v) {
       await commands.publish(project,
           target: targetFor('prod'),
           channel: 'prod',
-          appVersionMin: Version.parse('1.0.0'),
-          appVersionMax: Version.parse('1.9.9'));
+          appVersions: VersionConstraint.parse('>=1.0.0 <=1.9.9'));
 
       await expectLater(
         commands.rollout(project,
@@ -421,15 +421,15 @@ int normalize(int v) {
       await commands.publish(project,
           target: targetFor('prod'),
           channel: 'prod',
-          appVersionMin: Version.parse('1.0.0'),
-          appVersionMax: Version.parse('1.9.9'));
+          appVersions: VersionConstraint.parse('>=1.0.0 <=1.9.9'));
 
       await commands.revoke(project,
           target: targetFor('prod'), channel: 'prod', numbers: {1});
 
       final dist = p.join(root.path, 'dist', 'prod');
-      final manifest = PatchManifest.parse(
-          File(p.join(dist, 'manifest.json')).readAsStringSync());
+      final manifest = SignedManifest.parse(
+              File(p.join(dist, 'manifest.json')).readAsBytesSync())
+          .manifest;
       expect(manifest.revoked, {1});
       expect(File(p.join(dist, '1.mfp')).existsSync(), isTrue,
           reason: 'the file stays available for forensics');
@@ -443,19 +443,18 @@ int normalize(int v) {
       await commands.publish(project,
           target: targetFor('prod'),
           channel: 'prod',
-          appVersionMin: Version.parse('1.0.0'),
-          appVersionMax: Version.parse('1.9.9'));
+          appVersions: VersionConstraint.parse('>=1.0.0 <=1.9.9'));
       await commands.revoke(project,
           target: targetFor('prod'), channel: 'prod', numbers: {1});
       await commands.publish(project,
           target: targetFor('prod'),
           channel: 'prod',
-          appVersionMin: Version.parse('1.0.0'),
-          appVersionMax: Version.parse('1.9.9'));
+          appVersions: VersionConstraint.parse('>=1.0.0 <=1.9.9'));
 
-      final manifest = PatchManifest.parse(
-          File(p.join(root.path, 'dist', 'prod', 'manifest.json'))
-              .readAsStringSync());
+      final manifest = SignedManifest.parse(
+              File(p.join(root.path, 'dist', 'prod', 'manifest.json'))
+                  .readAsBytesSync())
+          .manifest;
       expect(manifest.patches.map((e) => e.number), contains(2));
       expect(manifest.revoked, {1});
     });

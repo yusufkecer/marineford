@@ -1,4 +1,3 @@
-import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -9,10 +8,10 @@ import 'config.dart';
 
 /// Where published patches go.
 ///
-/// One small interface with one shipped implementation. marineford publishes
-/// to static files on purpose, so this is not a plugin system waiting to happen
-/// — it exists so that "upload to S3" and "copy to a folder" cannot drift apart
-/// in how they lay a channel out.
+/// One small interface with one shipped implementation. marineford publishes to
+/// static files on purpose, so this is not a plugin system waiting to happen —
+/// it exists so that "copy to a folder" and whatever you sync that folder with
+/// cannot drift apart in how they lay a channel out.
 abstract interface class PublishTarget {
   /// Writes [bytes] to [path], relative to the channel root.
   Future<void> put(String path, Uint8List bytes);
@@ -26,8 +25,10 @@ abstract interface class PublishTarget {
 
 /// Publishes into a local directory.
 ///
-/// Useful for testing the whole pipeline without a network, and for anyone
-/// syncing a folder to their own host.
+/// The only target, and deliberately so. A channel is three kinds of file on a
+/// static host; every object store, CDN and web server already has a good tool
+/// for uploading a directory, and none of them need this project to reimplement
+/// their auth.
 final class DirectoryTarget implements PublishTarget {
   /// Creates a [DirectoryTarget] rooted at [root].
   DirectoryTarget(this.root);
@@ -55,10 +56,10 @@ final class DirectoryTarget implements PublishTarget {
 
 /// Reads and writes the manifest for one channel.
 ///
-/// Both sides of publishing go through `marineford_core`, so the manifest a command
-/// writes is validated by exactly the code the device will validate it with.
-/// A manifest this class produces and cannot read back is a bug caught here
-/// rather than on a phone.
+/// Both sides of publishing go through `marineford_core`, so the manifest a
+/// command writes is validated by exactly the code the device will validate it
+/// with. A manifest this class produces and cannot read back is a bug caught
+/// here rather than on a phone.
 final class ChannelPublisher {
   /// Creates a [ChannelPublisher].
   const ChannelPublisher({
@@ -66,6 +67,9 @@ final class ChannelPublisher {
     required this.project,
     required this.channel,
   });
+
+  /// Name of the single file a channel consists of, besides its patches.
+  static const String manifestFile = 'manifest.json';
 
   /// Where to write.
   final PublishTarget target;
@@ -77,21 +81,26 @@ final class ChannelPublisher {
   final String channel;
 
   /// Reads the current manifest, or an empty one if there is none yet.
+  ///
+  /// Does not verify the signature: this is the publisher, and it is about to
+  /// replace whatever is there with something it signs itself. Reading is only
+  /// to learn the next sequence and patch number.
   Future<PatchManifest> read() async {
-    final bytes = await target.get('manifest.json');
+    final bytes = await target.get(manifestFile);
     if (bytes == null) {
       return PatchManifest(
         schema: 1,
         appId: project.appId,
         channel: channel,
+        sequence: 0,
         generatedAt: DateTime.now().toUtc(),
         patches: const <PatchEntry>[],
       );
     }
-    final manifest = PatchManifest.parse(utf8.decode(bytes));
+    final manifest = SignedManifest.parse(bytes).manifest;
     if (manifest.appId != project.appId) {
       throw CliException(
-        'the manifest at ${target.describe('manifest.json')} belongs to '
+        'the manifest at ${target.describe(manifestFile)} belongs to '
         '"${manifest.appId}", but this project is "${project.appId}"',
         hint: 'Publishing would replace another app\'s patches. Check '
             '`app_id` in marineford.yaml and the target path.',
@@ -100,83 +109,81 @@ final class ChannelPublisher {
     return manifest;
   }
 
-  /// Writes [manifest] and its detached signature.
+  /// Signs [manifest] and writes it as a single file.
   ///
-  /// The signature covers the exact bytes written, which is why the encoding
-  /// happens once here and the same buffer is both signed and uploaded — a
-  /// re-encode between the two would eventually differ by a space and fail
-  /// verification on every device at once.
+  /// One file, one write. Publishing the manifest and its signature separately
+  /// leaves a window in which the new manifest is up and the old signature is
+  /// not — during which every device rejects the channel — and a failed second
+  /// upload leaves it that way until someone notices.
   Future<void> write(PatchManifest manifest, PatchSigner signer) async {
-    final bytes = Uint8List.fromList(utf8
-        .encode(const JsonEncoder.withIndent('  ').convert(manifest.toJson())));
+    final signedBytes = SignedManifest.bytesToSign(manifest);
+    final signature = await signer.sign(signedBytes);
+    final envelope = SignedManifest.encode(signedBytes, signature);
 
-    // Prove the device-side parser accepts what we are about to publish.
-    PatchManifest.parse(utf8.decode(bytes));
+    // Read it back the way a device would, including the signature check. If
+    // this fails, the channel was about to break for everyone.
+    final parsed = SignedManifest.parse(envelope);
+    final verifier = PatchVerifier(signer.publicKey);
+    if (!await verifier.verify(parsed.signedBytes, parsed.signature)) {
+      throw const CliException(
+        'the manifest failed its own signature check before upload',
+        hint: 'This is a bug in marineford, not in your project. Nothing was '
+            'written.',
+      );
+    }
 
-    await target.put('manifest.json', bytes);
-    await target.put('manifest.json.sig', await signer.sign(bytes));
+    await target.put(manifestFile, envelope);
   }
 
   /// Adds or replaces a patch entry and returns the new manifest.
-  PatchManifest withPatch(PatchManifest manifest, PatchEntry entry) {
-    final patches = <PatchEntry>[
-      for (final existing in manifest.patches)
-        if (existing.number != entry.number) existing,
-      entry,
-    ]..sort((a, b) => b.number.compareTo(a.number));
-    return PatchManifest(
-      schema: manifest.schema,
-      appId: manifest.appId,
-      channel: manifest.channel,
-      generatedAt: DateTime.now().toUtc(),
-      patches: patches,
-      revoked: manifest.revoked,
-    );
-  }
+  PatchManifest withPatch(PatchManifest manifest, PatchEntry entry) => _next(
+        manifest,
+        patches: <PatchEntry>[
+          for (final existing in manifest.patches)
+            if (existing.number != entry.number) existing,
+          entry,
+        ]..sort((a, b) => b.number.compareTo(a.number)),
+      );
 
   /// Returns a manifest with [numbers] added to the revoked list.
   PatchManifest withRevoked(PatchManifest manifest, Set<int> numbers) =>
-      PatchManifest(
-        schema: manifest.schema,
-        appId: manifest.appId,
-        channel: manifest.channel,
-        generatedAt: DateTime.now().toUtc(),
-        patches: manifest.patches,
-        revoked: <int>{...manifest.revoked, ...numbers},
-      );
+      _next(manifest, revoked: <int>{...manifest.revoked, ...numbers});
 
   /// Returns a manifest with [number]'s rollout fraction changed.
   PatchManifest withRollout(
       PatchManifest manifest, int number, double fraction) {
-    final target =
-        manifest.patches.where((entry) => entry.number == number).firstOrNull;
-    if (target == null) {
+    if (!manifest.patches.any((entry) => entry.number == number)) {
       throw CliException('patch #$number is not in the $channel manifest');
     }
-    return PatchManifest(
-      schema: manifest.schema,
-      appId: manifest.appId,
-      channel: manifest.channel,
-      generatedAt: DateTime.now().toUtc(),
+    return _next(
+      manifest,
       patches: <PatchEntry>[
         for (final entry in manifest.patches)
           if (entry.number == number)
-            PatchEntry(
-              number: entry.number,
-              url: entry.url,
-              size: entry.size,
-              sha256: entry.sha256,
-              abi: entry.abi,
-              runtime: entry.runtime,
-              rollout: fraction,
-              notes: entry.notes,
-            )
+            entry.copyWith(rollout: fraction)
           else
             entry,
       ],
-      revoked: manifest.revoked,
     );
   }
+
+  /// Every change bumps the sequence. Devices refuse anything not newer than
+  /// what they have already accepted, so a manifest published without advancing
+  /// it would be indistinguishable from a replay and simply ignored.
+  PatchManifest _next(
+    PatchManifest manifest, {
+    List<PatchEntry>? patches,
+    Set<int>? revoked,
+  }) =>
+      PatchManifest(
+        schema: manifest.schema,
+        appId: manifest.appId,
+        channel: manifest.channel,
+        sequence: manifest.sequence + 1,
+        generatedAt: DateTime.now().toUtc(),
+        patches: patches ?? manifest.patches,
+        revoked: revoked ?? manifest.revoked,
+      );
 
   /// The next free patch number.
   int nextNumber(PatchManifest manifest) {

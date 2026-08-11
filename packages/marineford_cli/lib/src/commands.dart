@@ -63,11 +63,11 @@ final class MarinefordCommands {
     await keyDirectory.create(recursive: true);
 
     final signer = await PatchSigner.generate();
-    final keyFile = File(p.join(keyDirectory.path, 'signing.key'));
+    final keyFile =
+        await _createPrivate(File(p.join(keyDirectory.path, 'signing.key')));
     await keyFile.writeAsString(base64Encode(await signer.extractSeed()));
     await File(p.join(keyDirectory.path, 'signing.pub'))
         .writeAsString(signer.publicKeyBase64);
-    _restrictPermissions(keyFile);
 
     await configFile.writeAsString('''
 # marineford project configuration.
@@ -114,13 +114,39 @@ size_budget_kb: 256
   }
 
   /// Compiles, lints and packs the patch, writing a `.mfp` to `out/`.
-  Future<File> build(MarinefordProject project, {String? abiOverride}) async {
+  ///
+  /// [appVersionMin] is the lowest app version the patch will be published for.
+  /// The linter needs it to tell you when an override's own constraint excludes
+  /// devices you are about to publish to.
+  Future<File> build(
+    MarinefordProject project, {
+    String? abiOverride,
+    Version? appVersionMin,
+  }) async {
     final signer = await _loadSigner(project);
     final registry = abiOverride == null ? _requireRegistry(project) : null;
-    final abi = abiOverride ?? registry!.abi;
+    final AbiFingerprint abi;
+    try {
+      abi = AbiFingerprint.parse(abiOverride ?? registry!.abi);
+    } on FormatException catch (e) {
+      throw CliException(
+        e.message,
+        hint: 'Run `dart run build_runner build` in your app so marineford_gen '
+            'can regenerate lib/marineford.g.dart.',
+      );
+    }
 
-    final built = await PatchBuilder(project)
-        .build(signer: signer, abi: abi, knownIds: registry?.ids);
+    if (abiOverride != null) {
+      console.write('note: --abi bypasses the generated registry, so override '
+          'ids cannot be checked for typos.');
+    }
+
+    final built = await PatchBuilder(project).build(
+      signer: signer,
+      abi: abi,
+      appVersionMin: appVersionMin ?? Version.parse('0.0.0'),
+      knownIds: registry?.ids,
+    );
 
     await project.outputDirectory.create(recursive: true);
     final file = File(p.join(project.outputDirectory.path, 'patch.mfp'));
@@ -151,8 +177,7 @@ size_budget_kb: 256
     MarinefordProject project, {
     required PublishTarget target,
     required String channel,
-    required Version appVersionMin,
-    required Version appVersionMax,
+    required VersionConstraint appVersions,
     File? patchFile,
     double rollout = 1.0,
     String? notes,
@@ -168,9 +193,34 @@ size_budget_kb: 256
     }
     final bytes = Uint8List.fromList(await file.readAsBytes());
 
-    // Parse what we are about to publish with the device-side reader. If this
-    // throws, the patch was never going to load anywhere.
+    // Everything a device will check, checked here first, against the same
+    // code. A patch that fails any of this was never going to load anywhere,
+    // and finding out now costs a second instead of a support ticket.
     final container = MfpContainer.parse(bytes);
+
+    final verifier = PatchVerifier(signer.publicKey);
+    if (!await verifier.verify(container.signedRegion, container.signature)) {
+      throw const CliException(
+        'the patch is not signed by this project\'s key',
+        hint: 'It was probably built before `marineford init` regenerated the '
+            'key, or copied from another project. Run `marineford build` '
+            'again.',
+      );
+    }
+
+    final registry = project.readIdRegistry();
+    if (registry != null && AbiFingerprint.tryParse(registry.abi) != null) {
+      final expected = AbiFingerprint.parse(registry.abi);
+      if (container.abi != expected) {
+        throw CliException(
+          'this patch was built against ABI ${container.abi}, but the app '
+          'currently generates $expected',
+          hint: 'The app changed after the patch was built. Run '
+              '`marineford build` again, or publish from the revision the '
+              'patch was built from.',
+        );
+      }
+    }
 
     final publisher = ChannelPublisher(
       target: target,
@@ -189,7 +239,7 @@ size_budget_kb: 256
         size: bytes.length,
         sha256: sha256Hex(bytes),
         abi: container.abi,
-        runtime: VersionConstraint.parse('>=$appVersionMin <=$appVersionMax'),
+        runtime: appVersions,
         rollout: rollout,
         notes: notes,
       ),
@@ -199,8 +249,8 @@ size_budget_kb: 256
     console
       ..write('Published patch #$number to $channel')
       ..write('  ${target.describe('$number.mfp')}')
-      ..write('  ${_kb(bytes.length)}, ABI ${container.abi.substring(0, 20)}…')
-      ..write('  apps >=$appVersionMin <=$appVersionMax')
+      ..write('  ${_kb(bytes.length)}, ABI ${_shortAbi(container.abi)}')
+      ..write('  apps $appVersions')
       ..write('  rollout ${(rollout * 100).toStringAsFixed(0)}%');
     if (rollout < 1.0) {
       console.write('');
@@ -276,15 +326,19 @@ size_budget_kb: 256
           'Run `marineford init`, or restore the key from your secret store.');
     }
 
-    if (_isGitTracked(project.root, project.privateKeyFile)) {
-      final relative =
-          p.relative(project.privateKeyFile.path, from: project.root.path);
-      bad(
-          'the signing key is tracked by git',
-          'Run `git rm --cached $relative`, then rotate the key: anything '
-              'already pushed has to be assumed compromised.');
-    } else {
-      ok('signing key is not in version control');
+    switch (_isGitTracked(project.root, project.privateKeyFile)) {
+      case true:
+        final relative =
+            p.relative(project.privateKeyFile.path, from: project.root.path);
+        bad(
+            'the signing key is tracked by git',
+            'Run `git rm --cached $relative`, then rotate the key: anything '
+                'already pushed has to be assumed compromised.');
+      case false:
+        ok('signing key is not in version control');
+      case null:
+        console.write('  ?     could not ask git whether the signing key is '
+            'tracked');
     }
 
     final registry = project.readIdRegistry();
@@ -298,9 +352,15 @@ size_budget_kb: 256
               'or @PatchableService. Start with a normaliser on your HTTP '
               'client\'s output.');
     } else {
-      ok('${registry.ids.length} patchable function'
-          '${registry.ids.length == 1 ? '' : 's'}, ABI '
-          '${registry.abi.substring(0, 20)}…');
+      final fingerprint = AbiFingerprint.tryParse(registry.abi);
+      if (fingerprint == null) {
+        bad('marineford_ids.json has a malformed ABI ("${registry.abi}")',
+            'Delete it and run `dart run build_runner build` again.');
+      } else {
+        ok('${registry.ids.length} patchable function'
+            '${registry.ids.length == 1 ? '' : 's'}, ABI '
+            '${_shortAbi(fingerprint)}');
+      }
     }
 
     final patchLib =
@@ -310,6 +370,40 @@ size_budget_kb: 256
     } else {
       bad('no patch package at ${project.patchPackage}/lib',
           'Create it, or point `patch_package` at the right directory.');
+    }
+
+    // The check the command has always promised and never performed: compile
+    // the patch and confirm every id it overrides is one the app declares. A
+    // typo here costs nothing at publish time and everything afterwards, since
+    // the override simply never fires.
+    if (registry != null && patchLib.existsSync()) {
+      try {
+        final signer = await _loadSigner(project);
+        final abi = AbiFingerprint.tryParse(registry.abi);
+        if (abi != null) {
+          final built = await PatchBuilder(project).build(
+            signer: signer,
+            abi: abi,
+            appVersionMin: Version.parse('0.0.0'),
+            knownIds: registry.ids,
+          );
+          final unknown = built.overrideIds
+              .where((id) => !registry.ids.contains(id))
+              .toList();
+          if (unknown.isEmpty) {
+            ok('${built.overrideIds.length} override'
+                '${built.overrideIds.length == 1 ? '' : 's'}, all known to the '
+                'app');
+          } else {
+            bad(
+                'the patch overrides ids the app does not declare: '
+                    '${unknown.join(', ')}',
+                'They will never fire. Check the spelling, or rebuild the app.');
+          }
+        }
+      } on CliException catch (e) {
+        bad('the patch package does not build', e.hint ?? e.message);
+      }
     }
 
     console.write(healthy ? '\nReady to publish.' : '\nNot ready.');
@@ -360,17 +454,42 @@ size_budget_kb: 256
 
   static String _kb(int bytes) => '${(bytes / 1024).toStringAsFixed(1)} KB';
 
-  static void _restrictPermissions(File file) {
-    if (Platform.isWindows) return;
-    try {
-      Process.runSync('chmod', <String>['600', file.path]);
-    } on ProcessException {
-      // Best effort; the .gitignore entry is the protection that matters.
-    }
+  /// A fingerprint short enough to read, long enough to tell two apart.
+  ///
+  /// Never substring the full form directly: it is only long enough by
+  /// convention, and a shorter one would throw where a log line was wanted.
+  static String _shortAbi(AbiFingerprint abi) {
+    final text = abi.toString();
+    return text.length <= 24 ? text : '${text.substring(0, 24)}…';
   }
 
-  static bool _isGitTracked(Directory root, File file) {
+  /// Creates [file] with restrictive permissions *before* anything is written.
+  ///
+  /// Order matters. Writing the key and then tightening the mode leaves a
+  /// window where the secret exists world-readable, which on a shared machine
+  /// is the whole exposure.
+  static Future<File> _createPrivate(File file) async {
+    await file.create(recursive: true);
+    if (!Platform.isWindows) {
+      try {
+        Process.runSync('chmod', <String>['600', file.path]);
+      } on ProcessException {
+        // Best effort; the .gitignore entry is the protection that matters.
+      }
+    }
+    return file;
+  }
+
+  /// Whether git tracks [file], or null when git could not answer.
+  ///
+  /// Distinguishes "not tracked" from "no git here". Reporting a missing git as
+  /// a clean bill of health is how a key ends up committed by someone who was
+  /// told it was safe.
+  static bool? _isGitTracked(Directory root, File file) {
     try {
+      final probe = Process.runSync('git', <String>['rev-parse', '--git-dir'],
+          workingDirectory: root.path);
+      if (probe.exitCode != 0) return null;
       final result = Process.runSync(
         'git',
         <String>['ls-files', '--error-unmatch', file.path],
@@ -378,16 +497,22 @@ size_budget_kb: 256
       );
       return result.exitCode == 0;
     } on ProcessException {
-      return false;
+      return null;
     }
   }
 
+  /// Appends the entries git does not already have, matching whole lines.
+  ///
+  /// Substring matching would consider `.marineford/signing.key` already
+  /// present because some unrelated line happens to contain it — and the one
+  /// entry that must never be missed is the one holding the signing key.
   static Future<void> _appendGitignore(
       Directory root, List<String> entries) async {
     final file = File(p.join(root.path, '.gitignore'));
     final existing = file.existsSync() ? await file.readAsString() : '';
-    final missing =
-        entries.where((entry) => !existing.contains(entry)).toList();
+    final lines =
+        const LineSplitter().convert(existing).map((l) => l.trim()).toSet();
+    final missing = entries.where((entry) => !lines.contains(entry)).toList();
     if (missing.isEmpty) return;
     await file.writeAsString(
       '${existing.isEmpty || existing.endsWith('\n') ? existing : '$existing\n'}'

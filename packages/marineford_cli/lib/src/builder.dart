@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import 'package:dart_eval/dart_eval.dart';
 import 'package:marineford_core/marineford_core.dart';
 import 'package:path/path.dart' as p;
+import 'package:pub_semver/pub_semver.dart';
 
 import 'config.dart';
 import 'lint.dart';
@@ -51,7 +52,8 @@ final class PatchBuilder {
   /// Compiles, lints, compresses and signs the patch package.
   Future<BuiltPatch> build({
     required PatchSigner signer,
-    required String abi,
+    required AbiFingerprint abi,
+    required Version appVersionMin,
     Set<String>? knownIds,
   }) async {
     final sources = _collectSources();
@@ -102,16 +104,14 @@ final class PatchBuilder {
     final warnings = PatchLinter(project).run(
       sources: sources,
       program: program,
+      appVersionMin: appVersionMin,
       knownIds: knownIds,
     );
 
     final evc = program.write();
     final payload = Uint8List.fromList(gzip.encode(evc));
 
-    final region = MfpContainer.buildSignedRegion(
-      payload: payload,
-      abiHash: _abiBytes(abi),
-    );
+    final region = MfpContainer.buildSignedRegion(payload: payload, abi: abi);
     final signature = await signer.sign(region);
 
     return BuiltPatch(
@@ -136,16 +136,26 @@ final class PatchBuilder {
     return sources;
   }
 
+  /// Whole words, not substrings.
+  ///
+  /// Matching `late` anywhere in the message fires on "translate", "related"
+  /// and "latency", and tells the developer their code uses a keyword it does
+  /// not. A wrong explanation is worse than none: it sends them looking in the
+  /// wrong place.
+  static final Map<RegExp, String> _unsupported = <RegExp, String>{
+    RegExp(r'\bmixins?\b'): 'dart_eval does not support mixins.',
+    RegExp(r'\bextension\b'): 'dart_eval does not support extension methods.',
+    RegExp(r'\b(yield|sync\*|async\*)\b'):
+        'dart_eval does not support generators (sync* / async*).',
+    RegExp(r'\blate\b'): 'dart_eval does not support `late`.',
+    RegExp(r'\btypedefs?\b'): 'dart_eval does not support typedefs.',
+    RegExp(r'\bdeferred\b'): 'dart_eval does not support deferred imports.',
+    RegExp(r'\bisolates?\b'): 'dart_eval does not support isolates.',
+  };
+
   static String _compileHint(String error) {
-    const unsupported = <String, String>{
-      'mixin': 'dart_eval does not support mixins.',
-      'extension': 'dart_eval does not support extension methods.',
-      'yield': 'dart_eval does not support generators (sync* / async*).',
-      'late': 'dart_eval does not support `late`.',
-      'typedef': 'dart_eval does not support typedefs.',
-    };
-    for (final entry in unsupported.entries) {
-      if (error.toLowerCase().contains(entry.key)) {
+    for (final entry in _unsupported.entries) {
+      if (entry.key.hasMatch(error)) {
         return '${entry.value} Rewrite that part of the patch without it; the '
             'rest of the file is fine.';
       }
@@ -153,20 +163,5 @@ final class PatchBuilder {
     return 'Patch code runs on dart_eval, which implements most but not all '
         'of Dart. Unsupported: mixins, extension methods, generators, '
         'typedefs, `late`, deferred imports, isolates.';
-  }
-
-  static Uint8List _abiBytes(String abi) {
-    if (!RegExp(r'^sha256:[0-9a-f]{64}$').hasMatch(abi)) {
-      throw CliException(
-        'the ABI fingerprint "$abi" is malformed',
-        hint: 'Run `dart run build_runner build` in your app so marineford_gen '
-            'can regenerate lib/marineford.g.dart.',
-      );
-    }
-    final hex = abi.substring('sha256:'.length);
-    return Uint8List.fromList(<int>[
-      for (var i = 0; i < 32; i++)
-        int.parse(hex.substring(i * 2, i * 2 + 2), radix: 16),
-    ]);
   }
 }

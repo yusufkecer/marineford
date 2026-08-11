@@ -29,6 +29,9 @@ Future<int> main(List<String> arguments) async {
   parser.addCommand('abi').addFlag('help', abbr: 'h', negatable: false);
 
   parser.addCommand('build')
+    ..addOption('min-app-version',
+        help: 'Lowest app version you will publish this patch for; lets the '
+            'linter check override constraints against it')
     ..addOption('abi', help: 'Override the ABI fingerprint. Testing only.')
     ..addFlag('help', abbr: 'h', negatable: false);
 
@@ -89,18 +92,21 @@ Future<int> main(List<String> arguments) async {
         await commands.abi(MarinefordProject.load());
 
       case 'build':
-        await commands.build(MarinefordProject.load(),
-            abiOverride: command.option('abi'));
+        await commands.build(
+          MarinefordProject.load(),
+          abiOverride: command.option('abi'),
+          appVersionMin: _optionalVersion(command, 'min-app-version'),
+        );
 
       case 'publish':
         final project = MarinefordProject.load();
         final channel = command.option('channel') ?? project.channel;
+        final constraint = _constraint(command);
         await commands.publish(
           project,
           target: _target(project, command.option('to')!, channel),
           channel: channel,
-          appVersionMin: _version(command, 'min-app-version'),
-          appVersionMax: _version(command, 'max-app-version'),
+          appVersions: constraint,
           rollout: _percent(command.option('percent')),
           notes: command.option('notes'),
         );
@@ -144,20 +150,37 @@ Future<int> main(List<String> arguments) async {
 PublishTarget _target(MarinefordProject project, String to, String channel) =>
     DirectoryTarget(Directory(p.join(project.root.path, to, channel)));
 
-Version _version(ArgResults command, String name) {
-  final raw = command.option(name);
+/// Parses `--app-versions`, refusing the shape that silently excludes almost
+/// everyone.
+///
+/// A `<=1.5.0` upper bound looks right and is not: pub_semver orders build
+/// metadata, so `1.5.0+42` — the form a Flutter app version takes as soon as it
+/// has a build number, which is always — sits *above* `1.5.0` and is excluded.
+/// The patch then silently never applies to the most common case there is.
+VersionConstraint _constraint(ArgResults command) {
+  final raw = command.option('app-versions');
   if (raw == null) {
-    throw CliException(
-      'publish needs --$name',
-      hint: 'A patch must say which app builds it is safe for. Use the '
-          'version range of the store releases that share this ABI.',
+    throw const CliException(
+      'publish needs --app-versions',
+      hint: 'A patch must say which app builds it is safe for. Use an '
+          "exclusive upper bound: --app-versions '>=1.4.0 <1.5.0'",
     );
   }
+  final VersionConstraint constraint;
   try {
-    return Version.parse(raw);
-  } on FormatException {
-    throw CliException('--$name: "$raw" is not a semantic version');
+    constraint = VersionConstraint.parse(raw);
+  } on FormatException catch (e) {
+    throw CliException('--app-versions: ${e.message}');
   }
+  if (RegExp(r'<=s*d').hasMatch(raw)) {
+    throw CliException(
+      '--app-versions uses an inclusive upper bound ($raw)',
+      hint: 'Build metadata sorts above the bare version, so <=1.5.0 excludes '
+          '1.5.0+42 — and a Flutter app version almost always carries a build '
+          'number. Use an exclusive bound instead: <1.5.1',
+    );
+  }
+  return constraint;
 }
 
 int _number(ArgResults command) {
@@ -181,4 +204,15 @@ double _percent(String? raw) {
     throw CliException('--percent must be between 0 and 100, got "$raw"');
   }
   return value / 100;
+}
+
+/// Parses an optional `--<name>` semantic version.
+Version? _optionalVersion(ArgResults command, String name) {
+  final raw = command.option(name);
+  if (raw == null) return null;
+  try {
+    return Version.parse(raw);
+  } on FormatException {
+    throw CliException('--$name: "$raw" is not a semantic version');
+  }
 }

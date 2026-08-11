@@ -1,4 +1,5 @@
 import 'package:dart_eval/dart_eval.dart';
+import 'package:pub_semver/pub_semver.dart';
 
 import 'config.dart';
 
@@ -33,9 +34,15 @@ final class LintFinding {
 ///
 /// The compiler already rejects code dart_eval cannot run. The linter covers
 /// the other category: code that compiles, loads and then behaves badly.
-/// Nothing here is a hard error, because every one of these is a judgement call
-/// the developer is better placed to make — but silence would be worse, since
-/// all of them are invisible until a user feels them.
+///
+/// Every check that can run against the *compiled program* does, rather than
+/// against the source text. The version-constraint check is the reason: source
+/// matching has to guess at formatting, and it guessed wrong — a long override
+/// id makes `dart format` wrap the annotation across lines with a trailing
+/// comma, which the pattern did not match, so the single most consequential
+/// mistake a patch author can make went unreported. The compiler has already
+/// resolved every constraint into `overrideMap`; reading it there cannot be
+/// fooled by whitespace.
 final class PatchLinter {
   /// Creates a [PatchLinter] for [project].
   const PatchLinter(this.project);
@@ -45,80 +52,116 @@ final class PatchLinter {
 
   /// Iterations above which an interpreted loop starts to cost real time.
   ///
-  /// An interpreted loop iteration measured ~107ns, so 1000 iterations is
-  /// ~107µs — about 0.6% of a 60fps frame for a single call. Ten thousand is
-  /// over a millisecond and worth mentioning.
+  /// An interpreted loop iteration measured ~110ns, so 1000 iterations is
+  /// ~110µs — about 0.7% of a 60fps frame for a single call.
   static const int loopIterationBudget = 1000;
 
-  static final _loopBound = RegExp(r'<\s*(\d{4,})\s*;');
-  static final _overrideId =
-      RegExp(r'''@RuntimeOverride\s*\(\s*['"]([^'"]+)['"]''');
-  static final _overrideWithoutVersion =
-      RegExp(r'''@RuntimeOverride\s*\(\s*['"][^'"]+['"]\s*\)''');
+  /// Matches any numeric loop bound, not just four-digit ones.
+  static final _loopBound = RegExp(r'<=?\s*(\d+)\s*;');
 
   /// Runs every check and returns what it found.
   List<LintFinding> run({
     required Map<String, String> sources,
     required Program program,
+    required Version appVersionMin,
     Set<String>? knownIds,
   }) {
-    final findings = <LintFinding>[];
-    final declared = <String>{};
+    final findings = <LintFinding>[
+      ..._checkConstraints(program, appVersionMin),
+      ..._checkLoops(sources),
+    ];
+    if (knownIds != null) {
+      findings.addAll(_checkIds(program, knownIds));
+    }
+    return findings;
+  }
 
-    sources.forEach((path, source) {
-      for (final match in _overrideId.allMatches(source)) {
-        declared.add(match.group(1)!);
+  /// Reads the constraints the compiler actually recorded.
+  ///
+  /// An `@RuntimeOverride` with no `version:` does not get "no constraint" — it
+  /// gets dart_eval's own default, which is a constraint on the *compiler's*
+  /// version and reads as the literal `<null` when that is unset. It then fails
+  /// to parse at load time and the override is dropped in silence. A patch like
+  /// that compiles, publishes and does nothing.
+  Iterable<LintFinding> _checkConstraints(Program program, Version appMin) {
+    final findings = <LintFinding>[];
+    program.overrideMap.forEach((id, spec) {
+      final constraint = spec.versionConstraint;
+      if (constraint == null) return;
+
+      final VersionConstraint parsed;
+      try {
+        parsed = VersionConstraint.parse(constraint);
+      } on FormatException {
+        findings.add(LintFinding(
+          LintSeverity.warning,
+          'override "$id" has no usable version constraint '
+          '(dart_eval recorded "$constraint")',
+          hint: 'Pass an explicit `version:` to @RuntimeOverride. Without one '
+              'dart_eval substitutes its own version, the constraint fails to '
+              'parse on the device, and the override silently never fires.',
+        ));
+        return;
       }
 
-      if (_overrideWithoutVersion.hasMatch(source)) {
-        findings.add(const LintFinding(
+      if (!parsed.allows(appMin)) {
+        findings.add(LintFinding(
           LintSeverity.warning,
-          'an @RuntimeOverride has no `version:` constraint',
-          hint: 'Without one, dart_eval defaults the constraint to its own '
-              'version, which no app will ever satisfy — so the override '
-              'silently never fires. Always pass an explicit version range.',
+          'override "$id" requires $parsed, which excludes the lowest app '
+          'version you are publishing for ($appMin)',
+          hint: 'Devices on $appMin will download this patch and then ignore '
+              'this override. Widen the constraint or narrow the publish '
+              'range.',
         ));
       }
+    });
+    return findings;
+  }
 
+  Iterable<LintFinding> _checkLoops(Map<String, String> sources) {
+    final findings = <LintFinding>[];
+    sources.forEach((path, source) {
       for (final match in _loopBound.allMatches(source)) {
         final iterations = int.tryParse(match.group(1)!) ?? 0;
         if (iterations > loopIterationBudget) {
           findings.add(LintFinding(
             LintSeverity.warning,
             '$path loops about $iterations times inside the patch',
-            hint: 'Interpreted iterations cost roughly 107ns each, so this is '
-                'around ${(iterations * 107 / 1000).round()}µs per call. Move '
+            hint: 'Interpreted iterations cost roughly 110ns each, so this is '
+                'around ${(iterations * 110 / 1000).round()}µs per call. Move '
                 'the loop into your compiled code and patch only the decision '
                 'it makes.',
           ));
         }
       }
     });
+    return findings;
+  }
 
-    if (knownIds != null) {
-      for (final id in declared) {
-        if (!knownIds.contains(id)) {
-          findings.add(LintFinding(
-            LintSeverity.warning,
-            'override id "$id" does not exist in the app',
-            hint: 'Nothing will call it. Check the spelling against '
-                'marineford_ids.json, or rebuild the app so the registry is '
-                'current.',
-          ));
-        }
-      }
-      final unpatched = knownIds.difference(declared);
-      if (declared.isNotEmpty && unpatched.length == knownIds.length) {
-        findings.add(const LintFinding(
+  Iterable<LintFinding> _checkIds(Program program, Set<String> knownIds) {
+    final findings = <LintFinding>[];
+    final declared = program.overrideMap.keys.toSet();
+
+    for (final id in declared) {
+      if (!knownIds.contains(id)) {
+        findings.add(LintFinding(
           LintSeverity.warning,
-          'this patch overrides nothing the app declares',
-          hint: 'Every id in the patch is unknown to the app. That usually '
-              'means the app and the patch were built from different '
-              'revisions.',
+          'override id "$id" does not exist in the app',
+          hint: 'Nothing will call it. Check the spelling against '
+              'marineford_ids.json, or rebuild the app so the registry is '
+              'current.',
         ));
       }
     }
 
+    if (declared.isNotEmpty && declared.intersection(knownIds).isEmpty) {
+      findings.add(const LintFinding(
+        LintSeverity.warning,
+        'this patch overrides nothing the app declares',
+        hint: 'Every id in the patch is unknown to the app. That usually means '
+            'the app and the patch were built from different revisions.',
+      ));
+    }
     return findings;
   }
 
