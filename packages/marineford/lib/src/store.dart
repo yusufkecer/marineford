@@ -77,7 +77,17 @@ final class PatchState {
         booting: clearBooting ? null : (booting ?? this.booting),
         bootAttempts: bootAttempts ?? this.bootAttempts,
         manifestEtag: clearEtag ? null : (manifestEtag ?? this.manifestEtag),
-        lastSequence: lastSequence ?? this.lastSequence,
+        // Monotonic, enforced here rather than at the call site.
+        //
+        // The high-water mark is the entire anti-replay defence, and a caller
+        // that lowers it — even while *refusing* the manifest that carried the
+        // lower number — hands an attacker a two-step replay: serve the old
+        // manifest once to drag the mark down, serve it again to have it
+        // accepted. Making the field incapable of going backwards means nobody
+        // has to remember this at any of the places that write state.
+        lastSequence: lastSequence == null || lastSequence < this.lastSequence
+            ? this.lastSequence
+            : lastSequence,
       );
 
   /// Reads state from JSON, falling back to defaults for anything unreadable.
@@ -119,6 +129,35 @@ final class PatchState {
         if (manifestEtag != null) 'manifestEtag': manifestEtag,
         'lastSequence': lastSequence,
       };
+
+  /// Value equality, so a caller can tell whether anything actually changed.
+  ///
+  /// Worth having because the alternative is writing the file on every manifest
+  /// check. Each write is a create, an fsync and a rename — and the common case,
+  /// by a wide margin, is a check that changes nothing at all.
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is PatchState &&
+          installId == other.installId &&
+          installed == other.installed &&
+          booting == other.booting &&
+          bootAttempts == other.bootAttempts &&
+          manifestEtag == other.manifestEtag &&
+          lastSequence == other.lastSequence &&
+          blocklist.length == other.blocklist.length &&
+          blocklist.containsAll(other.blocklist);
+
+  @override
+  int get hashCode => Object.hash(
+        installId,
+        installed,
+        booting,
+        bootAttempts,
+        manifestEtag,
+        lastSequence,
+        Object.hashAllUnordered(blocklist),
+      );
 
   @override
   String toString() => 'PatchState(installed: $installed, seq: $lastSequence, '

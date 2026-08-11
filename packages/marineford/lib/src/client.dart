@@ -309,6 +309,14 @@ final class MarinefordClient {
     _emit(DecisionMade(decision));
 
     switch (decision) {
+      case ManifestRejected(reason: final reason):
+        // Refused wholesale. Recording anything from it would treat a rejection
+        // as a commitment, and both ways of doing that are exploitable:
+        // adopting its sequence lets a replay walk the high-water mark down,
+        // and caching its ETag turns every later check into a 304 and makes the
+        // refusal permanent.
+        _emit(PatchRejectedEvent(null, reason));
+        return decision;
       case ApplyPatch(entry: final entry):
         final installed = await _download(entry);
         if (!installed) return decision;
@@ -325,11 +333,20 @@ final class MarinefordClient {
     // manifest again.
     //
     // The sequence advances on the same terms, and for the same reason.
-    _state = state.copyWith(
+    // PatchState keeps it monotonic regardless, so this cannot walk backwards.
+    final next = state.copyWith(
       manifestEtag: response.etag,
+      clearEtag: response.etag == null,
       lastSequence: manifest.sequence,
     );
-    await _store.writeState(_state!);
+    // Only touch the disk when something moved. A server that serves the
+    // manifest without an ETag gets a full 200 on every check, and the decision
+    // it leads to is almost always "nothing to do" — writing an identical file
+    // each time costs an fsync and a rename for no information gained.
+    if (next != state) {
+      _state = next;
+      await _store.writeState(next);
+    }
     return decision;
   }
 

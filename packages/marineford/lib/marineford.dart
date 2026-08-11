@@ -28,6 +28,7 @@ export 'package:marineford_core/marineford_core.dart'
     show
         AbiFingerprint,
         ApplyPatch,
+        ManifestRejected,
         MarinefordFormatException,
         PatchDecision,
         PatchEntry,

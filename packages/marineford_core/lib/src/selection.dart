@@ -110,13 +110,36 @@ final class RollBackToBase extends PatchDecision {
   String toString() => 'RollBackToBase($reason)';
 }
 
-/// Nothing to do.
+/// Nothing to do. The manifest was read and understood; no patch applied.
 final class StayOnCurrent extends PatchDecision {
   /// Creates a [StayOnCurrent] decision.
   const StayOnCurrent({super.rejections});
 
   @override
   String toString() => 'StayOnCurrent()';
+}
+
+/// The manifest itself was refused. Nothing in it was considered.
+///
+/// Kept distinct from [StayOnCurrent] because the two mean opposite things to a
+/// caller that records progress. "I read this manifest and no patch applied" is
+/// a result worth remembering — the ETag, the sequence. "I refused this
+/// manifest" is not, and remembering it is exploitable: adopting a refused
+/// manifest's sequence lets an attacker replay an old one twice, the first time
+/// to walk the high-water mark down and the second to have it accepted.
+///
+/// Conflating them by looking at whether rejections is empty does not work
+/// either: a manifest that was read perfectly well can still reject every patch
+/// in it for ordinary reasons, like a staged rollout this device is outside of.
+final class ManifestRejected extends PatchDecision {
+  /// Creates a [ManifestRejected] decision.
+  const ManifestRejected(this.reason);
+
+  /// Why the manifest as a whole was refused.
+  final String reason;
+
+  @override
+  String toString() => 'ManifestRejected($reason)';
 }
 
 /// Decides what to do with [manifest] on this device.
@@ -128,8 +151,10 @@ final class StayOnCurrent extends PatchDecision {
 /// The rules, in order:
 ///
 /// 1. A manifest for a different app is ignored outright.
-/// 2. A manifest at or below the highest sequence already accepted is stale and
-///    ignored — signatures never expire, so replay is otherwise free.
+/// 2. A manifest *below* the highest sequence already accepted is stale and
+///    ignored — signatures never expire, so replay is otherwise free. Equal is
+///    fine and common: re-reading an unchanged manifest is the normal case, and
+///    calling that an attack would cry wolf on every check.
 /// 3. A patch must match the fingerprint compiled into this build. Semver alone
 ///    does not catch a renamed method; the fingerprint does.
 /// 4. A patch must satisfy its own `runtime` constraint.
@@ -149,24 +174,20 @@ PatchDecision selectPatch(PatchManifest manifest, SelectionContext context) {
     // an attack that discarding the installed patch would mitigate, and
     // treating it as one hands anyone who can swap manifests a way to force
     // every device back onto the buggy store build. Do nothing, loudly.
-    return StayOnCurrent(rejections: <PatchRejection>[
-      PatchRejection.manifest(
-        'this manifest is for "${manifest.appId}" but this app is '
-        '"${context.appId}"; ignoring all of it',
-      ),
-    ]);
+    return ManifestRejected(
+      'this manifest is for "${manifest.appId}" but this app is '
+      '"${context.appId}"; ignoring all of it',
+    );
   }
 
   if (manifest.sequence < context.lastSequence) {
     // Strictly older, which a publisher never produces: the sequence only goes
     // up. Someone is serving a manifest from before something changed — most
     // usefully, from before a revocation.
-    return StayOnCurrent(rejections: <PatchRejection>[
-      PatchRejection.manifest(
-        'sequence ${manifest.sequence} is older than the last accepted '
-        '${context.lastSequence}; this manifest is stale and may be a replay',
-      ),
-    ]);
+    return ManifestRejected(
+      'sequence ${manifest.sequence} is older than the last accepted '
+      '${context.lastSequence}; this manifest is stale and may be a replay',
+    );
   }
 
   final rejections = <PatchRejection>[];

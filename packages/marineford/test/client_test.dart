@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -73,6 +74,12 @@ void main() {
     }
     return a + b; // the original
   }
+
+  _rejectedManifestState(
+    cdn: () => cdn,
+    makeClient: makeClient,
+    total: total,
+  );
 
   _gaps(
     root: () => root,
@@ -435,6 +442,55 @@ int total(int a, int b) { return a ~/ 0; }
   });
 
   group('disk hygiene', () {
+    test('a check that changes nothing does not rewrite the state file',
+        () async {
+      // The common case by a wide margin: the app checks, the manifest is the
+      // one it already acted on, and there is nothing to do. Rewriting an
+      // identical file costs a create, an fsync and a rename each time.
+      //
+      // Proved by leaving a marker in the file that the client's in-memory
+      // state does not contain. If a write happens the marker is gone; if it
+      // survives, the client genuinely left the disk alone.
+      await cdn.publish({7: await cdn.buildPatch(_patchSource)});
+      final client = makeClient();
+      await client.start();
+      await client.checkForUpdate();
+
+      final file = File('${root.path}${Platform.pathSeparator}state.json');
+      final saved = jsonDecode(file.readAsStringSync()) as Map<String, Object?>;
+      file.writeAsStringSync(jsonEncode(<String, Object?>{
+        ...saved,
+        'canary': 'untouched',
+      }));
+
+      expect(await client.checkForUpdate(), isA<StayOnCurrent>());
+
+      expect(
+        jsonDecode(file.readAsStringSync()),
+        containsPair('canary', 'untouched'),
+      );
+    });
+
+    test('a check that does change something still writes', () async {
+      // The other half. A guard that skipped too much would be far worse than
+      // the write it saves: the sequence and the ETag are what stop a replay
+      // and a redundant download.
+      await cdn.publish({7: await cdn.buildPatch(_patchSource)}, sequence: 3);
+      final client = makeClient();
+      await client.start();
+      await client.checkForUpdate();
+
+      await cdn
+          .publish({8: await cdn.buildPatch(_otherPatchSource)}, sequence: 4);
+      await client.checkForUpdate();
+
+      final file = File('${root.path}${Platform.pathSeparator}state.json');
+      expect(
+        jsonDecode(file.readAsStringSync()),
+        allOf(containsPair('lastSequence', 4), containsPair('installed', 8)),
+      );
+    });
+
     test('only the two newest patches are kept', () async {
       final store = PatchStore(root);
       for (var n = 5; n <= 9; n++) {
@@ -601,4 +657,103 @@ void _gaps({
 final class _ThrowingObserver implements PatchObserver {
   @override
   void onEvent(PatchEvent event) => throw StateError('observer is broken');
+}
+
+/// Second review round: what a rejected manifest leaves behind.
+void _rejectedManifestState({
+  required FakeCdn Function() cdn,
+  required MarinefordClient Function({
+    String appVersion,
+    String? abi,
+    PatchActivation activation,
+    int maxBootAttempts,
+    int failureThreshold,
+  }) makeClient,
+  required int Function(int, int) total,
+}) {
+  group('a rejected manifest changes nothing', () {
+    test('a stale manifest cannot lower the sequence high-water mark',
+        () async {
+      // Two-step replay. Serving a pre-revocation manifest once was supposed to
+      // be refused; if the refusal still records that manifest's sequence, the
+      // second serving of the very same bytes is accepted and the revocation
+      // never arrives. The defence would destroy itself after one attempt.
+      await cdn()
+          .publish({7: await cdn().buildPatch(_patchSource)}, sequence: 9);
+      final client = makeClient();
+      await client.start();
+      await client.checkForUpdate();
+      expect(client.state.lastSequence, 9);
+      expect(total(1, 1), 4);
+
+      // The attacker replays an older, still validly signed manifest.
+      await cdn().publish({7: await cdn().buildPatch(_patchSource)},
+          revoked: <int>{}, sequence: 5);
+      final first = await client.checkForUpdate();
+      expect(first, isA<ManifestRejected>());
+      expect(client.state.lastSequence, 9,
+          reason: 'refusing a manifest must not adopt its sequence');
+
+      // Same bytes again. Still refused.
+      final second = await client.checkForUpdate();
+      expect(second, isA<ManifestRejected>());
+      expect((second as ManifestRejected).reason, contains('stale'));
+      expect(client.state.lastSequence, 9);
+    });
+
+    test('a manifest for another app cannot move this app\'s sequence',
+        () async {
+      await cdn()
+          .publish({7: await cdn().buildPatch(_patchSource)}, sequence: 9);
+      final client = makeClient();
+      await client.start();
+      await client.checkForUpdate();
+
+      await cdn().publish({7: await cdn().buildPatch(_patchSource)},
+          appId: 'com.other.app', sequence: 2);
+      await client.checkForUpdate();
+
+      expect(client.state.lastSequence, 9,
+          reason: 'another app signed with the same key must not reset this '
+              'app\'s high-water mark');
+    });
+
+    test('a refused manifest does not record its ETag either', () async {
+      cdn().etag = 'W/"good"';
+      await cdn()
+          .publish({7: await cdn().buildPatch(_patchSource)}, sequence: 9);
+      final client = makeClient();
+      await client.start();
+      await client.checkForUpdate();
+
+      cdn().etag = 'W/"stale"';
+      await cdn()
+          .publish({7: await cdn().buildPatch(_patchSource)}, sequence: 5);
+      await client.checkForUpdate();
+
+      expect(client.state.manifestEtag, 'W/"good"',
+          reason: 'caching a manifest the client refused would make the '
+              'refusal permanent');
+    });
+
+    test('a CDN that stops sending ETags does not leave a stale one behind',
+        () async {
+      // copyWith treats null as "unchanged", which is why it has an explicit
+      // clear flag. A caller that forgets it leaves the device sending
+      // If-None-Match for a manifest the server no longer tags.
+      cdn().etag = 'W/"v1"';
+      await cdn().publish({7: await cdn().buildPatch(_patchSource)});
+      final client = makeClient();
+      await client.start();
+      await client.checkForUpdate();
+      expect(client.state.manifestEtag, 'W/"v1"');
+
+      cdn().etag = null;
+      await cdn().publish({8: await cdn().buildPatch(_otherPatchSource)});
+      await client.checkForUpdate();
+
+      expect(client.state.manifestEtag, isNull,
+          reason: 'the server stopped tagging; the client must stop asking');
+    });
+  });
 }

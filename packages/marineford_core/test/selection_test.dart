@@ -167,8 +167,8 @@ void main() {
     test('a manifest for another app is ignored, not acted on', () {
       final d = selectPatch(
           manifest([entry(7)], appId: 'com.other.app'), ctx(installed: 3));
-      expect(d, isA<StayOnCurrent>());
-      expect(d.rejections.single.reason, contains('com.other.app'));
+      expect(d, isA<ManifestRejected>());
+      expect((d as ManifestRejected).reason, contains('com.other.app'));
     });
 
     test('a wrong-app manifest cannot be used to force a downgrade', () {
@@ -176,7 +176,7 @@ void main() {
       // could push every device back onto the buggy store build.
       final d =
           selectPatch(manifest([], appId: 'com.other.app'), ctx(installed: 9));
-      expect(d, isA<StayOnCurrent>(),
+      expect(d, isA<ManifestRejected>(),
           reason: 'the installed patch must survive a misdirected manifest');
     });
   });
@@ -267,7 +267,7 @@ void _gaps() {
     test('a manifest below the accepted sequence is ignored', () {
       final d =
           selectPatch(manifest([entry(7)], sequence: 3), ctx(lastSequence: 5));
-      expect(d, isA<StayOnCurrent>());
+      expect(d, isA<ManifestRejected>());
     });
 
     test('replaying a pre-revocation manifest cannot un-revoke a patch', () {
@@ -277,8 +277,8 @@ void _gaps() {
       final beforeRevocation = manifest([entry(7)], sequence: 4);
       final d =
           selectPatch(beforeRevocation, ctx(installed: 7, lastSequence: 5));
-      expect(d, isA<StayOnCurrent>());
-      expect(d.rejections.single.reason, contains('replay'));
+      expect(d, isA<ManifestRejected>());
+      expect((d as ManifestRejected).reason, contains('replay'));
     });
 
     test('a newer sequence is accepted', () {
@@ -287,9 +287,12 @@ void _gaps() {
       expect(d, isA<ApplyPatch>());
     });
 
-    test('the manifest rejection is not attributed to a patch number', () {
+    test('a wholesale refusal is its own decision, not a patch rejection', () {
+      // The distinction the client depends on: "I read this and nothing
+      // applied" is worth recording, "I refused this" is not.
       final d = selectPatch(manifest([], sequence: 1), ctx(lastSequence: 9));
-      expect(d.rejections.single.number, isNull);
+      expect(d, isA<ManifestRejected>());
+      expect(d.rejections, isEmpty);
     });
   });
 
