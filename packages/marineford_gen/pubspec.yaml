@@ -29,9 +29,11 @@ dependencies:
   source_gen: ^4.2.4
 
 dev_dependencies:
-  # build_runner >=2.15.2 analyzer >=13'e geciyor; dart_eval 0.8.5 analyzer
-  # ^8.2.0'da. Kullanicinin uygulamasi ikisini birden cekecegi icin ust sinir
-  # burada da bilerek 2.15.x. Detay: plan.md §13.
+  # Deliberately capped. build_runner >=2.15.2 moves to analyzer >=13, while
+  # dart_eval 0.8.5 pins analyzer ^8.2.0 — and an application depends on both,
+  # so the ceiling is the user's problem as much as ours. It resolves today.
+  # The way out, if it stops resolving: this package does not depend on
+  # dart_eval at all, so its analyzer constraint can be separated.
   build_runner: ">=2.15.0 <2.15.2"
   build_test: ^3.5.0
   lints: ^6.0.0

@@ -6,11 +6,12 @@ analyzer:
     strict-inference: true
     strict-raw-types: true
   errors:
-    # Bu repoda public API dokümantasyonu zorunlu — pub.dev puanı ve
-    # kütüphanenin okunabilirliği buna bağlı.
+    # Public API documentation is required here. It carries pub.dev score, but
+    # mostly it is how anyone reading this library finds out why a rule exists.
     public_member_api_docs: warning
-    # Sessiz hata yutma bu projede kabul edilemez: patch akışında yutulan
-    # bir hata sahada teşhis edilemez hale gelir (bkz. plan.md §6.2).
+    # A swallowed exception in the patch pipeline is a patch that silently does
+    # nothing, on a device nobody can attach a debugger to. Every catch in this
+    # repository has to say what it is catching and why.
     empty_catches: error
     unawaited_futures: error
   exclude:

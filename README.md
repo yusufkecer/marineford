@@ -618,8 +618,6 @@ dart test packages/marineford_core packages/marineford_annotation packages/marin
 flutter test packages/marineford example/json_drift_app
 ```
 
-Architecture, measurements, findings and the v2 plan are in [plan.md](plan.md).
-
 ## License
 
 MIT. See [LICENSE](packages/marineford_core/LICENSE).
