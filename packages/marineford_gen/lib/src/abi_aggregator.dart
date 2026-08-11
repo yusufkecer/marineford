@@ -29,7 +29,6 @@ final class AbiAggregator implements Builder {
   @override
   Future<void> build(BuildStep buildStep) async {
     final records = <Map<String, Object?>>[];
-    var contract = kShimContractVersion;
     await for (final input
         in buildStep.findAssets(Glob('**/*.marineford.dart'))) {
       for (final line in const LineSplitter()
@@ -40,7 +39,22 @@ final class AbiAggregator implements Builder {
         if (decoded is! Map<String, Object?>) continue;
         final declared = decoded['contract'];
         if (declared is int) {
-          contract = declared;
+          // The contract version belongs to the generator that is running, not
+          // to the files it reads. Taking the number from a shim would make the
+          // fingerprint depend on which shims happen to be on disk and in what
+          // order they were visited — so an incremental build after a generator
+          // upgrade could produce a fingerprint that neither version agrees
+          // with, and the mismatch would only show up as patches silently not
+          // loading. A stale shim is a build-state problem with a one-line fix,
+          // so say so instead of hashing it in.
+          if (declared != kShimContractVersion) {
+            throw StateError(
+                '${input.path} was generated for shim contract v$declared, but '
+                'this generator writes v$kShimContractVersion. The build '
+                'directory is stale. Run `dart run build_runner build '
+                '--delete-conflicting-outputs` (or `build_runner clean` first) '
+                'to regenerate every shim against one contract.');
+          }
           continue;
         }
         records.add(decoded);
@@ -63,7 +77,7 @@ final class AbiAggregator implements Builder {
       }
     }
 
-    final abi = AbiBuilder(contractVersion: contract);
+    final abi = AbiBuilder(contractVersion: kShimContractVersion);
     for (final record in records) {
       abi.add(
         id: '${record['id']}',
@@ -102,13 +116,14 @@ final class AbiAggregator implements Builder {
 
 /// ABI fingerprint of this build's patchable surface.
 ///
-/// Pass this to `MarinefordConfig.abi`. The runtime refuses any patch built against
-/// a different fingerprint, which is what stops a patch compiled for an older
-/// build from loading against changed method signatures — the failure semver
-/// alone cannot catch.
+/// Pass this to `MarinefordConfig.abi`. The runtime refuses any patch built
+/// against a different fingerprint, which is what stops a patch compiled for an
+/// older build from loading against changed method signatures — the failure
+/// semver alone cannot catch.
 ///
 /// Covers ${records.length} patchable function${records.length == 1 ? '' : 's'}.
-const String kMarinefordAbi = '$abi';
+const String kMarinefordAbi =
+    '$abi';
 
 /// Every dispatch id in this build, sorted.
 ///
