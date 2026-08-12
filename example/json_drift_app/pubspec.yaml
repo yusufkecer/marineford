@@ -15,8 +15,6 @@ dependencies:
   flutter:
     sdk: flutter
   marineford: ^0.1.0-dev
-  marineford_annotation: ^0.1.0-dev
-  marineford_core: ^0.1.0-dev
   pub_semver: ^2.1.5
 
 dev_dependencies:
@@ -25,5 +23,8 @@ dev_dependencies:
     sdk: flutter
   lints: ^6.0.0
   marineford_cli: ^0.1.0-dev
+  # Only the tests reach for it; the app itself gets what it needs through
+  # `marineford`, which re-exports the core types a caller touches.
+  marineford_core: ^0.1.0-dev
   marineford_gen: ^0.1.0-dev
   path: ^1.9.0

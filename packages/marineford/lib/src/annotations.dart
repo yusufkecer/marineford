@@ -1,11 +1,3 @@
-/// Annotations for marineford.
-///
-/// This package has no dependencies on purpose: your application depends on it
-/// to *mark* patchable code, and your patch package depends on it to *provide*
-/// replacements. Neither should have to pull in a runtime or a code generator
-/// to do so.
-library;
-
 import 'package:meta/meta_meta.dart';
 
 /// Marks a top-level function as replaceable by a patch at runtime.
@@ -99,33 +91,11 @@ final class PatchableService {
   final List<String> exclude;
 }
 
-/// Declares a replacement for a marked function, inside a patch package.
-///
-/// The [id] must match one of the ids in the application's generated id
-/// registry; `marineford doctor` verifies this before you publish.
-///
-/// [version] is a pub_semver constraint checked against the running app's
-/// version. It is effectively required: leave it out and dart_eval substitutes
-/// a constraint on *its own* version, which no app satisfies, so the override
-/// compiles, publishes and silently never fires. `marineford build` warns.
-///
-/// ```dart
-/// @RuntimeOverride('pkg:app/lib/pricing.dart#PricingRules.cartTotal',
-///     version: '>=1.4.0 <1.5.0')
-/// int cartTotalFixed(Cart cart) => 0;
-/// ```
-///
-/// The class name is significant: dart_eval's compiler matches this annotation
-/// by identifier, so it cannot be renamed or aliased. It is also deliberately
-/// *not* restricted by [Target] — the patch package is compiled by dart_eval,
-/// not by the Dart SDK, and the analyzer never sees it.
-final class RuntimeOverride {
-  /// Creates a [RuntimeOverride] annotation.
-  const RuntimeOverride(this.id, {this.version});
-
-  /// Dispatch id of the marked function this replaces.
-  final String id;
-
-  /// pub_semver constraint on the app version this replacement applies to.
-  final String? version;
-}
+// `@RuntimeOverride`, the patch-side annotation, is deliberately not here.
+//
+// A patch package is compiled by dart_eval, not by the Dart SDK, and the CLI
+// feeds dart_eval only the files under the patch package's own `lib/` — so a
+// `package:` import never reaches the compiler. Every patch declares the class
+// inline. Shipping it as an API would put it in autocomplete and dartdoc as
+// something to import, which is the one thing that cannot work. The shape and
+// the reasoning live in the README's "Write a patch" section instead.

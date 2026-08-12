@@ -22,7 +22,7 @@ flutter analyze && dart format --set-exit-if-changed .
 They are split, and not arbitrarily:
 
 ```bash
-dart test packages/marineford_core packages/marineford_annotation packages/marineford_gen packages/marineford_cli
+dart test packages/marineford_core packages/marineford_gen packages/marineford_cli
 ```
 
 ```bash

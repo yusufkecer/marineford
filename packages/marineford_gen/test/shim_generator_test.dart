@@ -48,6 +48,8 @@ String asLibrary(String output, [String extra = '']) => 'library x;\n$extra\n'
     '${output.replaceFirst("part of 'pricing.dart';", '')}';
 
 const _runtimeStub = r'''
+export 'src/annotations.dart';
+
 final class Patch {
   static int get generation => 0;
   static int? slot(String id) => null;
@@ -83,7 +85,9 @@ Future<String> generate(String source) async {
   await testBuilder(
     PartBuilder(<Generator>[ShimGenerator()], '.marineford.dart'),
     <String, String>{
-      'marineford_annotation|lib/marineford_annotation.dart': _annotationStub,
+      // Declared where the real ones live, because the generator matches the
+      // annotations by their library URL.
+      'marineford|lib/src/annotations.dart': _annotationStub,
       'marineford|lib/marineford.dart': _runtimeStub,
       'app|lib/pricing.dart': source,
     },
@@ -129,7 +133,6 @@ Future<String> generateError(String source) async {
 const _imports = '''
 import 'dart:async';
 import 'package:marineford/marineford.dart';
-import 'package:marineford_annotation/marineford_annotation.dart';
 part 'pricing.marineford.dart';
 ''';
 

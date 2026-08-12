@@ -109,7 +109,6 @@ dart pub global activate --source path packages/marineford_cli
 ```yaml
 dependencies:
   marineford: ^0.1.0
-  marineford_annotation: ^0.1.0
 
 dev_dependencies:
   build_runner: ^2.15.0
@@ -139,7 +138,6 @@ means you can never publish again for builds already in the field.
 ```dart
 // lib/api_client.dart
 import 'package:marineford/marineford.dart';
-import 'package:marineford_annotation/marineford_annotation.dart';
 
 part 'api_client.marineford.dart';
 
@@ -240,6 +238,18 @@ Map normalize(String endpoint, Map raw) {
 ```
 
 The id must match one in `marineford_ids.json`. `marineford build` verifies it.
+
+Three things about that annotation are worth knowing, because none of them are
+enforced by the analyzer — it never sees this file.
+
+* **Declare it, do not import it.** `marineford` does not export it, and could
+  not usefully: the CLI hands dart_eval only the files under `patch/lib/`, so a
+  `package:` import never reaches the compiler.
+* **`version` is effectively required.** Leave it out and dart_eval substitutes a
+  constraint on *its own* version, which no app satisfies — the override
+  compiles, publishes, and silently never fires. `marineford build` warns.
+* **The name cannot change.** dart_eval matches this annotation by identifier,
+  so `RuntimeOverride` cannot be renamed or aliased.
 
 ### 8. Ship it
 
@@ -397,6 +407,11 @@ one outcome worth refusing at build time.
 A `Future`-returning function is patchable. The shim hands the interpreter's
 future back, converts the resolved value, and falls back to the original if the
 patch fails — the same guarantee the synchronous path gives, one await later.
+
+An async dispatch measures **4.8µs** against 2.6µs for a synchronous one. Nearly
+all of the difference is the suspend and resume; **74ns** of it is the zone each
+async call forks for itself, which is what makes a post-await failure
+attributable to the call it belongs to instead of vanishing.
 
 Two limits come from dart_eval rather than from marineford, and both are build
 errors:
@@ -633,9 +648,8 @@ library's.
 
 | Package | What it is |
 |---|---|
-| [`marineford`](packages/marineford) | The Flutter runtime: dispatch, download, verify, activate, roll back. |
+| [`marineford`](packages/marineford) | The Flutter runtime: dispatch, download, verify, activate, roll back. Also `@patchable` and `@PatchableService`, since anything marking a function already depends on it. |
 | [`marineford_core`](packages/marineford_core) | Pure Dart. Manifest, `.mfp` container, signatures, patch selection, rollout bucketing. Shared by the runtime and the CLI so both sides agree on the rules. |
-| [`marineford_annotation`](packages/marineford_annotation) | `@patchable`, `@PatchableService`, `@RuntimeOverride`. Zero dependencies. |
 | [`marineford_gen`](packages/marineford_gen) | `build_runner` generator for the dispatch shims and the ABI fingerprint. |
 | [`marineford_cli`](packages/marineford_cli) | The `marineford` command. |
 | [`example/json_drift_app`](example/json_drift_app) | One marked function repairing eight backend changes, end to end. |
@@ -684,7 +698,7 @@ harness, because `build_test` drives `build_runner`, which needs the Dart VM's
 own package resolution.
 
 ```bash
-dart test packages/marineford_core packages/marineford_annotation packages/marineford_gen packages/marineford_cli
+dart test packages/marineford_core packages/marineford_gen packages/marineford_cli
 ```
 
 ```bash

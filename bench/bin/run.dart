@@ -13,8 +13,14 @@ import 'package:pub_semver/pub_semver.dart';
 /// Every performance claim in the README and the plan comes from here. They are
 /// committed and run rather than remembered, because the design rests on a
 /// handful of specific costs — 2.4ns for a marked call with no patch, ~2.5µs to
-/// cross into the interpreter, ~107ns per interpreted loop iteration — and each
-/// one justifies a decision that would be wrong if the number moved.
+/// cross into the interpreter, ~107ns per interpreted loop iteration, ~74ns to
+/// fork the zone an async dispatch needs — and each one justifies a decision
+/// that would be wrong if the number moved.
+///
+/// Measure a small cost on its own, never by subtracting two large ones. The
+/// zone figures here were once derived by differencing two interpreter
+/// crossings and reported 454ns for something that costs 11ns; consecutive runs
+/// of that same subtraction gave +158ns and -515ns.
 ///
 /// Run with `--check` to fail when a measurement drifts past its tolerance.
 ///
@@ -29,7 +35,7 @@ import 'package:pub_semver/pub_semver.dart';
 /// nothing anyone experiences.
 const bool _isAot = bool.fromEnvironment('dart.vm.product');
 
-void main(List<String> args) {
+Future<void> main(List<String> args) async {
   final check = args.contains('--check');
   if (check && !_isAot) {
     stderr.writeln('Refusing to check budgets under the JIT.\n\n'
@@ -47,7 +53,7 @@ void main(List<String> args) {
   final results = <_Result>[];
 
   results.addAll(_dispatchCosts());
-  results.addAll(_interpreterCosts());
+  results.addAll(await _interpreterCosts());
   results.addAll(_jsonBridgeCosts());
   results.addAll(_patchSizes());
 
@@ -82,6 +88,18 @@ final class _Result {
 
   String get formatted => '${value.toStringAsFixed(value < 10 ? 2 : 0)} $unit';
   String formatBudget() => '${budget!.toStringAsFixed(0)} $unit';
+}
+
+Future<double> _timeNsAsync(
+    int iterations, Future<void> Function() body) async {
+  for (var i = 0; i < 200; i++) {
+    await body();
+  }
+  final stopwatch = Stopwatch()..start();
+  for (var i = 0; i < iterations; i++) {
+    await body();
+  }
+  return stopwatch.elapsedMicroseconds * 1000 / iterations;
 }
 
 double _timeNs(int iterations, void Function() body) {
@@ -153,6 +171,51 @@ int _cachedShim(int a, int b) {
   return _native(a, b);
 }
 
+/// The runtime helper a hand-written shim would call instead of being emitted.
+///
+/// This is the question codegen's existence turns on. If a developer can write
+/// the marking by hand at a cost close to the generated form, the generator
+/// becomes a convenience — go_router's model, where the builder is optional and
+/// hand-written routes are equally correct. If it is far off, codegen earns its
+/// place and the argument is over.
+///
+/// Never inlined for the same reason as [_naiveLookup]: in the real dispatcher
+/// this is a static call into another library, so a closure handed to it
+/// genuinely escapes. Left inlinable, escape analysis deletes the allocation and
+/// the comparison measures nothing.
+@pragma('vm:never-inline')
+R _dispatch<A, B, R>(String id, A a, B b, R Function(A, B) original) {
+  final slot = _slot(id);
+  if (slot != null) {
+    // The real helper boxes the arguments and crosses into the interpreter.
+    // Neither measurement reaches this branch: with no patch the table is null,
+    // and with another patch live the lookup misses.
+    _dispatched++;
+    return original(a, b);
+  }
+  return original(a, b);
+}
+
+int _dispatched = 0;
+
+/// The same id [_guardedShim] asks for, and deliberately so: it is absent from
+/// [_realisticSlots], so both shapes are measured on a miss. Naming the entry
+/// that *is* present measures a dispatch instead, which is a different question.
+const String _handId = 'bench#add';
+
+/// Hand-written, passing the original as a top-level tear-off.
+///
+/// Dart canonicalises a tear-off of a top-level function, so this allocates
+/// nothing per call — the shape worth measuring.
+int _handShimTearoff(int a, int b) => _dispatch(_handId, a, b, _native);
+
+/// Hand-written, passing a closure.
+///
+/// The form a developer writes without thinking about it, and the one that
+/// allocates on every call whether or not a patch is live.
+int _handShimClosure(int a, int b) =>
+    _dispatch(_handId, a, b, (int x, int y) => _native(x, y));
+
 /// A slot table the size a real app's would be.
 ///
 /// Measuring against a one-entry map would flatter the lookup: hashing the key
@@ -175,6 +238,8 @@ List<_Result> _dispatchCosts() {
   final native = _timeNs(iterations, () => sink += _native(2, 3));
   final guarded = _timeNs(iterations, () => sink += _guardedShim(2, 3));
   final naive = _timeNs(iterations, () => sink += _naiveShim(2, 3));
+  final handTearoff = _timeNs(iterations, () => sink += _handShimTearoff(2, 3));
+  final handClosure = _timeNs(iterations, () => sink += _handShimClosure(2, 3));
 
   // Now with a patch live. Not a patch on *this* function — the interesting
   // case is the other marked functions in the app, which keep running their
@@ -184,10 +249,21 @@ List<_Result> _dispatchCosts() {
   _generation++;
   final missGuarded = _timeNs(iterations, () => sink += _guardedShim(2, 3));
   final missCached = _timeNs(iterations, () => sink += _cachedShim(2, 3));
+  final missHandTearoff =
+      _timeNs(iterations, () => sink += _handShimTearoff(2, 3));
+  final missHandClosure =
+      _timeNs(iterations, () => sink += _handShimClosure(2, 3));
   _slots = null;
   _generation++;
 
   if (sink == 0) throw StateError('optimised away');
+  // Neither hand-written measurement may have taken the dispatch branch: with
+  // no patch the table is null, and with another patch live the lookup misses.
+  // If it fired, the comparison is against the wrong path.
+  if (_dispatched != 0) {
+    throw StateError('the hand-written shim dispatched; it is measuring a '
+        'patched call, not a marked one');
+  }
 
   return <_Result>[
     _Result('unmarked call', native, 'ns'),
@@ -195,6 +271,12 @@ List<_Result> _dispatchCosts() {
         budget: 15),
     _Result('marked call, no patch (naive, for contrast)', naive, 'ns'),
     _Result('marked call, another patch live (map lookup)', missGuarded, 'ns'),
+    _Result('hand-written, no patch (tear-off)', handTearoff, 'ns'),
+    _Result('hand-written, no patch (closure)', handClosure, 'ns'),
+    _Result(
+        'hand-written, another patch live (tear-off)', missHandTearoff, 'ns'),
+    _Result(
+        'hand-written, another patch live (closure)', missHandClosure, 'ns'),
     _Result('marked call, another patch live (cached slot)', missCached, 'ns',
         budget: 15),
   ];
@@ -218,6 +300,9 @@ int loop(int a) {
   for (var i = 0; i < 1000; i++) { total = total + a + i; }
   return total;
 }
+
+@RuntimeOverride('#asyncTrivial', version: '>=1.0.0')
+Future asyncTrivial(int a) async { return a + 1; }
 
 @RuntimeOverride('#parse', version: '>=1.0.0')
 String parse(Map response) {
@@ -292,7 +377,7 @@ Object? _unwrapViaReified(Object? value) {
   return value;
 }
 
-List<_Result> _interpreterCosts() {
+Future<List<_Result>> _interpreterCosts() async {
   stdout.writeln('Measuring interpreter costs...');
 
   final compileWatch = Stopwatch()..start();
@@ -338,6 +423,59 @@ List<_Result> _interpreterCosts() {
   final direct = _timeNs(30000, () => invoke('#trivial', 1));
   final zoned = _timeNs(30000, () => guard.run(() => invoke('#trivial', 1)));
 
+  // The zone costs are measured on their own, not by differencing two
+  // crossings. A crossing is ~2.6µs and its run-to-run spread is well above
+  // 100ns, so subtracting one from another to recover a ~150ns figure reports
+  // the noise and nothing else: the same pair gave +158ns and -515ns on
+  // consecutive runs of this file.
+  ZoneSpecification spec() => ZoneSpecification(
+        handleUncaughtError: (Zone self, ZoneDelegate parent, Zone zone,
+            Object error, StackTrace stackTrace) {},
+      );
+  var zoneSink = 0;
+  final bare = _timeNs(2000000, () => zoneSink++);
+  final entered = _timeNs(2000000, () => guard.run(() => zoneSink++));
+  // What an async dispatch has to do, and cannot avoid: it cannot share the
+  // zone above, because dart_eval reports a failure after an await as an
+  // uncaught error in whichever zone the continuation captured — a shared one
+  // catches it with no call to attribute it to, and the future the caller holds
+  // never completes at all. One zone per call is what turns that back into an
+  // answer, and this is what the answer costs.
+  final forkedEach = _timeNs(500000, () {
+    Zone.current.fork(specification: spec()).run(() => zoneSink++);
+  });
+  if (zoneSink == 0) throw StateError('optimised away');
+
+  /// The shape `Patch.dispatchAsync` runs, without the Flutter dependency.
+  Future<Object?> dispatchAsync(String id, Object? argument) {
+    final settled = Completer<Object?>();
+    final zone = Zone.current.fork(
+      specification: ZoneSpecification(
+        handleUncaughtError: (Zone self, ZoneDelegate parent, Zone inner,
+            Object error, StackTrace stackTrace) {
+          if (!settled.isCompleted) settled.complete(null);
+        },
+      ),
+    );
+    final outcome = zone.run(() => invoke(id, argument));
+    if (outcome is Future<Object?>) {
+      zone.run(() => outcome.then<void>(
+            (Object? value) {
+              if (!settled.isCompleted) settled.complete(value);
+            },
+            onError: (Object error, StackTrace stackTrace) {
+              if (!settled.isCompleted) settled.complete(null);
+            },
+          ));
+    } else {
+      settled.complete(outcome);
+    }
+    return settled.future;
+  }
+
+  final asyncCrossing =
+      await _timeNsAsync(5000, () => dispatchAsync('#asyncTrivial', 1));
+
   final trivial = _timeNs(30000, () => invoke('#trivial', 1));
   final loop = _timeNs(2000, () => invoke('#loop', 1));
   final payload =
@@ -356,8 +494,16 @@ List<_Result> _interpreterCosts() {
         budget: 15),
     _Result('the same crossing inside the guard zone', zoned / 1000, 'us',
         budget: 20),
-    _Result('zone guard overhead per crossing', zoned - direct, 'ns',
-        budget: 800),
+    _Result('entering the guard zone', entered - bare, 'ns', budget: 800),
+    _Result('forking a zone per call, over entering one', forkedEach - entered,
+        'ns',
+        budget: 600),
+    _Result(
+        'async crossing (fork, suspend, resume)', asyncCrossing / 1000, 'us',
+        budget: 25),
+    _Result('async crossing over a synchronous one',
+        (asyncCrossing - direct) / 1000, 'us',
+        budget: 15),
     _Result('interpreted loop iteration', perIteration, 'ns', budget: 600),
     _Result('realistic JSON normaliser call', parse / 1000, 'us', budget: 25),
   ];
@@ -465,10 +611,26 @@ final class _LazyView extends MapBase<Object?, Object?> {
 
 /// Prices the deep copy that every marked call with a JSON payload pays.
 ///
-/// The design assumes this is small next to the ~2.6µs it costs to enter the
-/// interpreter at all — which is the argument for wrapping eagerly instead of
-/// building a lazy view over the original map. Assumptions like that are worth
-/// a number, because the conclusion flips if a payload is big enough.
+/// The design wraps eagerly on the assumption that this is small next to the
+/// ~2.6µs it costs to enter the interpreter at all. The numbers below say that
+/// assumption holds for a small payload and stops holding for a realistic one:
+/// 5 keys costs 421ns, 50 costs 3.3µs — the crossing itself — and 50 rows of 8
+/// fields costs 35µs, thirteen crossings.
+///
+/// The break-even below makes the same point from the other side. Eager wrapping
+/// buys 2ns per key read for 3.3µs down, so it only pays off after ~1700 reads
+/// of the same map, and a normaliser reads a handful. **A lazy view would be
+/// cheaper for every payload anyone actually patches.**
+///
+/// It is not built, and the reason is not this number. `_LazyView` below
+/// explains it: dart_eval reaches past `$Map.operator []` into `$value`, so a
+/// lazy view has to *be* the backing map and owe the whole `Map` interface,
+/// with key translation in every method. One method that forgets returns wrong
+/// data silently, which is the failure the deep copy exists to make impossible.
+/// Against that, 35µs once per HTTP response is not worth buying.
+///
+/// Revisit if a payload-heavy function is ever marked on a hot path — that is
+/// the condition under which this trade flips, and it is the only one.
 ///
 /// Measured at the entry points the generator actually emits, in both
 /// directions, because the return path is where the cost concentrates.

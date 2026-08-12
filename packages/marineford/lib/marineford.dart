@@ -37,6 +37,7 @@ export 'package:marineford_core/marineford_core.dart'
         RollBackToBase,
         StayOnCurrent;
 
+export 'src/annotations.dart' show Patchable, PatchableService, patchable;
 export 'src/client.dart' show Marineford, MarinefordClient;
 export 'src/config.dart' show MarinefordConfig, PatchActivation;
 export 'src/dispatch.dart'

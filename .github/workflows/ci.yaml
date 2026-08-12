@@ -43,7 +43,7 @@ jobs:
       # drives build_runner, which needs the Dart VM's own package resolution
       # and cannot write assets inside the Flutter test harness.
       - name: Test (Dart packages)
-        run: dart test packages/marineford_core packages/marineford_annotation packages/marineford_gen packages/marineford_cli
+        run: dart test packages/marineford_core packages/marineford_gen packages/marineford_cli
 
       - name: Test (Flutter runtime)
         run: flutter test packages/marineford example/json_drift_app

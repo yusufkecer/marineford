@@ -8,7 +8,6 @@ environment:
   sdk: ^3.6.0
 
 workspace:
-  - packages/marineford_annotation
   - packages/marineford_core
   - packages/marineford
   - packages/marineford_gen

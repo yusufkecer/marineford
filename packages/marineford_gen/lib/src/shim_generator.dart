@@ -5,7 +5,6 @@ import 'package:analyzer/dart/element/element.dart';
 import 'package:analyzer/dart/element/nullability_suffix.dart';
 import 'package:analyzer/dart/element/type.dart';
 import 'package:build/build.dart';
-import 'package:marineford_annotation/marineford_annotation.dart';
 import 'package:source_gen/source_gen.dart';
 
 import 'types.dart';
@@ -80,8 +79,13 @@ final class ShimGenerator extends Generator {
   /// Creates a [ShimGenerator].
   ShimGenerator();
 
-  static const _patchable = TypeChecker.typeNamed(Patchable);
-  static const _service = TypeChecker.typeNamed(PatchableService);
+  // Matched by URL rather than by type, so the generator depends on neither the
+  // runtime nor an annotation package. It cannot depend on the runtime: that is
+  // a Flutter package, and a build_runner generator runs under the plain Dart
+  // VM. The only coupling left is this string.
+  static const _annotations = 'package:marineford/src/annotations.dart';
+  static const _patchable = TypeChecker.fromUrl('$_annotations#Patchable');
+  static const _service = TypeChecker.fromUrl('$_annotations#PatchableService');
 
   @override
   Future<String?> generate(LibraryReader library, BuildStep buildStep) async {

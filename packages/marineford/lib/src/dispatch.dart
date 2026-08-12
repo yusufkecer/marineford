@@ -66,10 +66,16 @@ final class Patch {
   /// Reached without a signing key: an ordinary fire-and-forget mistake is
   /// enough, which makes it the more likely of the two to be met in practice.
   ///
-  /// Costs 454ns per crossing, against 2.6µs for the crossing itself — see
+  /// Entering it costs 11ns, against 2.6µs for the crossing it wraps — see
   /// `bench/`. Paid only while a patch is live and only on calls that actually
   /// dispatch, and it buys the difference between an app that degrades and one
   /// that dies.
+  ///
+  /// That figure used to read 454ns, which was noise rather than a cost: it was
+  /// arrived at by timing a crossing inside the zone, timing one outside, and
+  /// subtracting — two ~2.6µs measurements whose spread is far wider than the
+  /// number being recovered. Consecutive runs of the same pair gave +158ns and
+  /// -515ns. The zone is now timed on its own.
   static Zone? _zone;
 
   /// The zone [dispatchAsync] installed for the call currently being started.

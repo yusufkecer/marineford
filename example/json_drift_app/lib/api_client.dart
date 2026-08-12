@@ -1,5 +1,4 @@
 import 'package:marineford/marineford.dart';
-import 'package:marineford_annotation/marineford_annotation.dart';
 
 part 'api_client.marineford.dart';
 
