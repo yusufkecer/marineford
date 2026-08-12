@@ -370,12 +370,14 @@ and then silently falls back.
 |---|---|
 | `int`, `double`, `bool`, `num` | yes |
 | `String` | yes |
-| `List`, `Map`, `Set`, `Iterable` | yes |
+| `List`, `Map`, `Set`, `Iterable` | yes, with element types below |
 | `Object`, `dynamic` | yes |
 | nullable versions of all the above | yes |
 | `void` return | yes |
+| `Future<T>` return, for any `T` above | yes |
 | your own classes | **no** — build error |
-| `Future`, `Stream` | **no** — build error |
+| `Stream`, `FutureOr` | **no** — build error |
+| `Future` as a *parameter* | **no** — build error |
 | function types / callbacks | **no** — build error |
 | named or optional parameters | **no** — build error |
 
@@ -383,8 +385,35 @@ If a parameter is your own domain object, move the boundary rather than the
 type: mark a function further up the call chain whose parameters are already
 JSON-shaped. That is usually the better boundary anyway.
 
-Async is not a real limitation in practice. Keep the `await` in your compiled
-code and mark the synchronous function it feeds — that is where the bug lives.
+A collection's element type has to be something the unwrapping actually
+produces — `dynamic`, a primitive, `String`, `Map<String, dynamic>` or
+`List<dynamic>`. `List<Map<String, dynamic>>` is fine; `List<Map<String, int>>`
+is a build error, because the value would be converted to `dynamic` and then
+fail the check, and a patch that loads and is discarded on every call is the
+one outcome worth refusing at build time.
+
+### Async
+
+A `Future`-returning function is patchable. The shim hands the interpreter's
+future back, converts the resolved value, and falls back to the original if the
+patch fails — the same guarantee the synchronous path gives, one await later.
+
+Two limits come from dart_eval rather than from marineford, and both are build
+errors:
+
+* **`try`/`catch` around an `await` does not work.** The catch frame is dropped
+  at the suspension point, so a handler written after an `await` never runs.
+  `marineford build` refuses a patch that contains one.
+* **The `Future` surface is small.** Interpreted code gets `Future.delayed` and
+  `.then`. There is no `Future.wait`, `Future.value`, `catchError`,
+  `whenComplete` or `timeout`, and `async*` / `sync*` / `await for` are not
+  supported at all. Anything else fails to compile, with a message naming it.
+
+One more thing worth knowing: an async patch that fails takes the whole patch
+down for the session. dart_eval does not restore its frame bookkeeping when an
+async call unwinds, so the runtime is not trustworthy afterwards — every marked
+function goes back to its original body rather than spending more calls on it.
+The next launch starts clean.
 
 ---
 

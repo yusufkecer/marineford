@@ -145,6 +145,52 @@ Map normalize(Map raw) {
       );
     });
 
+    test('a patch catching around an await is refused', () async {
+      // dart_eval drops the catch at the suspension point, so the handler never
+      // runs. Error handling that is written and silently dead is worse than
+      // none, because the author stops looking at that case.
+      final project = await initProject();
+      writeIdRegistry();
+      writePatchPackage('''
+@RuntimeOverride('pkg:app/lib/api.dart#normalize', version: '>=1.0.0')
+Future normalize(Map raw) async {
+  try {
+    await Future.delayed(Duration(milliseconds: 1));
+    return raw;
+  } catch (e) {
+    return {};
+  }
+}
+''');
+
+      await expectLater(
+        commands.build(project),
+        throwsA(isA<CliException>().having(
+            (CliException e) => '${e.message} ${e.hint}',
+            'message',
+            allOf(contains('await'), contains('catch')))),
+      );
+    });
+
+    test('a try block without an await still builds', () async {
+      // The other half: the check is about the suspension point, not about
+      // try/catch, and ordinary synchronous error handling works in a patch.
+      final project = await initProject();
+      writeIdRegistry();
+      writePatchPackage('''
+@RuntimeOverride('pkg:app/lib/api.dart#normalize', version: '>=1.0.0')
+Map normalize(Map raw) {
+  try {
+    return raw;
+  } catch (e) {
+    return {};
+  }
+}
+''');
+
+      await expectLater(commands.build(project), completes);
+    });
+
     test('a patch that stays away from platform libraries still builds',
         () async {
       // The other half: the check must not fire on ordinary code that happens

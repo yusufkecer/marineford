@@ -25,7 +25,7 @@ const String abiMarker = 'MARINEFORD-ABI: ';
 /// changes, patches built against the old one are not safe to load even though
 /// every user-visible signature is identical. Bump this whenever the emitted
 /// call sequence changes.
-const int kShimContractVersion = 3;
+const int kShimContractVersion = 4;
 
 /// Local variable names the generated shims use.
 ///
@@ -381,11 +381,15 @@ ${overrides.toString().trimRight()}
     // check, whether or not a patch is live.
     lines.writeln('    final $_slotVar = $slotExpression;');
     lines.writeln('    if ($_slotVar != null) {');
-    lines.writeln(
-        '      final $_resultVar = ${signature.invocation(_slotVar, id)};');
     if (signature.isAsync) {
       lines.write(_awaitBody(id, signature, fallback));
-    } else if (signature.returnsVoid) {
+      lines.writeln('    }');
+      lines.write('    return $fallback;');
+      return lines.toString();
+    }
+    lines.writeln(
+        '      final $_resultVar = ${signature.invocation(_slotVar, id)};');
+    if (signature.returnsVoid) {
       lines.writeln('      if ($_resultVar != null) return;');
     } else if (signature.returnIsNullable) {
       lines.writeln(
@@ -437,12 +441,12 @@ ${overrides.toString().trimRight()}
   /// which is the same signal the synchronous dispatcher already uses — so the
   /// three branches below are the synchronous ones, one await later.
   String _awaitBody(String id, _Signature signature, String fallback) {
-    const inner = '          ';
+    const inner = '        ';
     final lines = StringBuffer()
-      ..writeln('      if ($_resultVar != null && '
-          '!identical($_resultVar, patchedNull)) {')
-      ..writeln("        return Patch.awaitPatched($_resultVar, r'$id')")
-      ..writeln('            .then(($_valueVar) {')
+      ..writeln('      return Patch.dispatchAsync(')
+      ..writeln('        () => ${signature.invocation(_slotVar, id)},')
+      ..writeln("        r'$id',")
+      ..writeln('      ).then(($_valueVar) {')
       ..writeln('${inner}if ($_valueVar == null) return $fallback;');
     if (signature.returnsVoid) {
       lines.writeln('${inner}return null;');
@@ -459,9 +463,7 @@ ${overrides.toString().trimRight()}
         ..write(_convert(signature,
             indent: inner, source: _valueVar, fallback: fallback));
     }
-    lines
-      ..writeln('        });')
-      ..writeln('      }');
+    lines.writeln('      });');
     return lines.toString();
   }
 

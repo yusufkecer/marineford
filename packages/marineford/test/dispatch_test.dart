@@ -618,81 +618,69 @@ Future mapResult(int a) async {
       );
     });
 
-    Object? call(String id, int argument) =>
-        Patch.invoke1(Patch.slot(id)!, argument, id);
+    Future<Object?> dispatch(String id, int argument) => Patch.dispatchAsync(
+        () => Patch.invoke1(Patch.slot(id)!, argument, id), id);
 
-    test('an async patch comes back as a future, not a reified value', () {
-      // $Future is also a $Value. Reifying it would produce a *different*
-      // future that unwraps one level deep, and the shim would then convert
-      // the wrong thing.
-      expect(call('#slow', 41), isA<Future<Object?>>());
-    });
-
-    test('awaiting it gives the resolved value', () async {
-      expect(await Patch.awaitPatched(call('#slow', 41)!, '#slow'), 42);
+    test('an async patch resolves to its value', () async {
+      expect(await dispatch('#slow', 41), 42);
     });
 
     test('a patch that resolves to null is distinguishable from a failure',
         () async {
-      final value =
-          await Patch.awaitPatched(call('#nullResult', 1)!, '#nullResult');
+      final value = await dispatch('#nullResult', 1);
       expect(identical(value, patchedNull), isTrue,
           reason: 'null means "the patch failed"; the sentinel means "the '
               'patch said null"');
     });
 
     test('a collection resolves through the same conversion', () async {
-      final value =
-          await Patch.awaitPatched(call('#mapResult', 7)!, '#mapResult');
-      expect(MarinefordJson.mapOf<String, dynamic>(value),
+      expect(
+          MarinefordJson.mapOf<String, dynamic>(
+              await dispatch('#mapResult', 7)),
           <String, dynamic>{'value': 7});
     });
 
-    // Blocked: inside the guarded zone an interpreted async function that
-    // throws after its first await never completes its future — dart_eval
-    // delivers the error to the zone's handleUncaughtError instead of to the
-    // completer the caller is holding. Outside a zone the same patch rejects
-    // normally, so this is the zone and the interpreter disagreeing about who
-    // owns the failure. Reproduced standalone; see the async section of the
-    // README for where this stands.
-    const blocked = 'async failure after an await is swallowed by the guarded '
-        'zone and the future never completes';
-
-    test('a throw after the await is counted and answers null', skip: blocked,
-        () async {
-      // The channel the synchronous catch cannot see: dart_eval rejects the
-      // returned future rather than throwing out of the call.
-      final raw = call('#lateBoom', 5);
-      expect(raw, isA<Future<Object?>>(),
-          reason: 'the failure has not happened yet at this point');
-      expect(await Patch.awaitPatched(raw!, '#lateBoom'), isNull);
+    test('a throw after the await answers null instead of hanging', () async {
+      // The failure dart_eval does not deliver as a rejection: it arrives as an
+      // uncaught error in the zone the continuation captured, and the future
+      // the caller holds never completes at all. The per-call zone is what
+      // turns that back into an answer.
+      expect(await dispatch('#lateBoom', 5), isNull);
       expect(failures, ['#lateBoom']);
     });
 
-    test('a throw before the first await arrives synchronously', () {
+    test('a throw before the first await is answered the same way', () async {
       // dart_eval runs an async body eagerly to its first suspension point, so
-      // this one never becomes a future at all and `_run` catches it.
-      expect(call('#earlyBoom', 5), isNull);
+      // this one never becomes a future and `_run` catches it synchronously.
+      expect(await dispatch('#earlyBoom', 5), isNull);
       expect(failures, ['#earlyBoom']);
     });
 
-    test('a success resets the consecutive failure count', skip: blocked,
-        () async {
-      await Patch.awaitPatched(call('#lateBoom', 5)!, '#lateBoom');
-      expect(Patch.failureCount, 1);
-      await Patch.awaitPatched(call('#slow', 1)!, '#slow');
-      expect(Patch.failureCount, 0,
-          reason: 'the threshold counts consecutive failures, not lifetime '
-              'ones');
+    test('a run of successes keeps the patch live', () async {
+      for (var i = 0; i < 5; i++) {
+        expect(await dispatch('#slow', i), i + 1);
+      }
+      expect(Patch.failureCount, 0);
+      expect(Patch.isActive, isTrue);
     });
 
-    test('repeated async failures deactivate the patch', skip: blocked,
-        () async {
-      for (var i = 0; i < 3; i++) {
-        await Patch.awaitPatched(call('#lateBoom', 5)!, '#lateBoom');
-      }
-      expect(Patch.isActive, isFalse);
-      expect(failures.length, 3);
+    test('one async failure drops the patch immediately', () async {
+      // Not a policy choice so much as an accounting of what dart_eval leaves
+      // behind: an async failure unwinds without restoring the frame
+      // bookkeeping pushed at the suspension, and the next dispatch reads a
+      // frame that is not its own. Verified by removing the deactivate below —
+      // the following call then answers null instead of 42.
+      expect(await dispatch('#lateBoom', 5), isNull);
+      expect(failures, ['#lateBoom']);
+      expect(Patch.isActive, isFalse,
+          reason: 'the runtime is not usable after this, so waiting for the '
+              'threshold would only spend more crossings on it');
+    });
+
+    test('every call after an async failure runs the original', () async {
+      await dispatch('#lateBoom', 5);
+      expect(Patch.slot('#slow'), isNull,
+          reason: 'no slot means the shim never calls the interpreter again');
     });
   });
 }

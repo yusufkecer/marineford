@@ -111,7 +111,9 @@ void main() {
     // prevent.
     AbiBuilder sameSurface(int contract) {
       final abi = AbiBuilder(contractVersion: contract);
-      abi.add(id: 'pkg:app/lib/a.dart#one', parameterTypes: ['int'],
+      abi.add(
+          id: 'pkg:app/lib/a.dart#one',
+          parameterTypes: ['int'],
           returnType: 'int');
       return abi;
     }

@@ -66,6 +66,7 @@ final class PatchBuilder {
     }
 
     _rejectPlatformImports(sources);
+    _rejectCatchAroundAwait(sources);
 
     final Program program;
     try {
@@ -178,6 +179,15 @@ final RegExp _platformImport = RegExp(
   multiLine: true,
 );
 
+/// A `try` block, taken as far as the `on`/`catch`/`finally` that ends it.
+///
+/// Approximate by construction — a regex cannot balance braces — but it only
+/// has to be good enough to notice an `await` sitting inside one.
+final RegExp _tryBlock = RegExp(
+  r'\btry\s*\{(.*?)\}\s*(?:on\b|catch\b|finally\b)',
+  dotAll: true,
+);
+
 /// Refuses a patch that imports a platform library.
 ///
 /// marineford grants a patch no permissions at all, so every one of these calls
@@ -192,6 +202,41 @@ final RegExp _platformImport = RegExp(
 /// things — which is exactly why the enforcement lives in the runtime sandbox
 /// and not here. This exists so an honest mistake is caught by the person who
 /// made it, at build time, with a sentence explaining why.
+/// Refuses a `try` block containing an `await`.
+///
+/// dart_eval does not run the catch. `Await` drops the frame's catch registry
+/// at the suspension point and the resume installs a fresh empty one, so
+/// everything after the first `await` unwinds straight past every handler the
+/// author wrote. A patch whose error handling is written and never runs is
+/// worse than one with none: the author believes the case is covered.
+///
+/// Matched on the text, so the same caveat as [_rejectPlatformImports] applies
+/// — a guard against the honest mistake, not a proof. It errs toward flagging:
+/// any `await` between a `try {` and its closing brace counts, even one that
+/// could not throw.
+void _rejectCatchAroundAwait(Map<String, String> sources) {
+  final offenders = <String>[];
+  sources.forEach((path, source) {
+    for (final match in _tryBlock.allMatches(source)) {
+      if (match.group(1)!.contains(RegExp(r'\bawait\b'))) {
+        offenders.add(path);
+        break;
+      }
+    }
+  });
+  if (offenders.isEmpty) return;
+
+  throw CliException(
+    'a patch cannot catch around an `await`:\n'
+    '${offenders.map((o) => '  $o').join('\n')}',
+    hint: 'dart_eval discards the catch at the suspension point, so the '
+        'handler never runs and the failure escapes as if it were not there. '
+        'Move the await out of the try, or let the failure happen: a patched '
+        'function that throws falls back to the original, which is usually the '
+        'behaviour the catch was reaching for anyway.',
+  );
+}
+
 void _rejectPlatformImports(Map<String, String> sources) {
   final offenders = <String>[];
   sources.forEach((path, source) {

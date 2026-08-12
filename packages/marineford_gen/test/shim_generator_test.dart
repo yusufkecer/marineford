@@ -58,7 +58,9 @@ final class Patch {
           [String id = '']) =>
       null;
   static Object? invokeN(int o, List<Object?> a, [String id = '']) => null;
-  static Future<Object?> awaitPatched(Object r, [String id = '']) async => null;
+  static Future<Object?> dispatchAsync(Object? Function() i,
+          [String id = '']) async =>
+      null;
 }
 const Object patchedNull = Object();
 abstract final class MarinefordJson {
@@ -324,8 +326,8 @@ $signature
     });
 
     test('a nullable Future return', () async {
-      await rejects('Future<int>? _maybe(int v) => null;',
-          'a nullable `Future` return');
+      await rejects(
+          'Future<int>? _maybe(int v) => null;', 'a nullable `Future` return');
     });
 
     test('a nested Future return', () async {
@@ -362,12 +364,18 @@ Future<Map<String, dynamic>> _fetch(String url) async => const {};
       expect(
         collapse(output),
         contains(collapse('''
-          return Patch.awaitPatched(
-            _mfResult,
+          return Patch.dispatchAsync(
+            () => Patch.invoke1(
+              _mfSlot,
+              MarinefordJson.wrap(url),
+              r'pkg:app/lib/pricing.dart#fetch',
+            ),
             r'pkg:app/lib/pricing.dart#fetch',
           ).then((_mfValue) {
             if (_mfValue == null) return _fetch(url);
         ''')),
+        reason: 'the interpreter call has to happen inside the per-call zone, '
+            'so it is passed in rather than made first',
       );
       expect(
         collapse(output),
@@ -404,7 +412,8 @@ $_imports
 @patchable
 Future<Map<String, dynamic>?> _maybe(int v) async => null;
 ''');
-      expect(collapse(output),
+      expect(
+          collapse(output),
           contains(collapse('if (identical(_mfValue, patchedNull)) '
               'return null;')));
       expectValidDart(asLibrary(output));
@@ -416,7 +425,8 @@ $_imports
 @patchable
 Future<int> _score(int base) async => base;
 ''');
-      expect(collapse(output),
+      expect(
+          collapse(output),
           contains(collapse('if (identical(_mfValue, patchedNull)) '
               'return _score(base);')));
     });
@@ -466,9 +476,11 @@ class RulesBase {
 }
 ''');
       expect(collapse(output), contains(collapse('_mfSync();')));
-      expect(collapse(output), contains(collapse('Patch.awaitPatched(')));
-      expect(collapse(output),
-          contains(collapse('if (_mfValue == null) return super.total(a, b);')));
+      expect(collapse(output), contains(collapse('Patch.dispatchAsync(')));
+      expect(
+          collapse(output),
+          contains(
+              collapse('if (_mfValue == null) return super.total(a, b);')));
       expectValidDart(asLibrary(output));
     });
   });
