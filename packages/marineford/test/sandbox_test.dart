@@ -1,7 +1,10 @@
+import 'dart:io';
+
 import 'package:dart_eval/dart_eval.dart';
 import 'package:dart_eval/dart_eval_bridge.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:marineford/marineford.dart';
+import 'package:path/path.dart' as p;
 
 const _header = '''
 class RuntimeOverride {
@@ -164,6 +167,58 @@ int leak(int a) {
               'the sandbox overwrote it');
     });
   });
+
+  test('the denied list still matches the dart_eval it was audited against',
+      () {
+    // `deniedIoBridges` is a hand audit of dart_eval's `dart:io` bindings —
+    // specifically, the ones it forgot to put behind `assertPermission`. The
+    // constraint is `^0.8.5`, so a patch release can add a binding and this
+    // file would not change: the sandbox would quietly stop covering
+    // everything it claims to.
+    //
+    // Nothing here can tell whether a new binding is gated. What it can do is
+    // notice that nobody has looked since the version changed, which is the
+    // part that actually goes wrong.
+    final lock = _workspaceLock();
+    final resolved = RegExp(r'dart_eval:[\s\S]{0,400}?version: "([^"]+)"')
+        .firstMatch(lock)
+        ?.group(1);
+
+    expect(resolved, isNotNull,
+        reason: 'could not find dart_eval in the workspace lockfile');
+    expect(
+      resolved,
+      MarinefordSandbox.auditedDartEvalVersion,
+      reason: 'dart_eval moved to $resolved. Re-read its dart:io bindings — '
+          'anything calling out without `assertPermission` belongs in '
+          'MarinefordSandbox.deniedIoBridges — then update '
+          'auditedDartEvalVersion. socket.dart is where the last one was.',
+    );
+  });
+}
+
+/// The *workspace* lockfile, wherever the test was launched from.
+///
+/// Identified by the pubspec beside it declaring `workspace:`, not by being the
+/// first `pubspec.lock` on the way up. `.gitignore` keeps package-level lock
+/// files out of the repository but does not stop them existing — `dart pub get
+/// -C packages/marineford_cli` writes one — and a canary that reads whichever
+/// file it happens to meet is not checking what it says it checks.
+String _workspaceLock() {
+  for (var dir = Directory.current;; dir = dir.parent) {
+    final pubspec = File(p.join(dir.path, 'pubspec.yaml'));
+    final lock = File(p.join(dir.path, 'pubspec.lock'));
+    if (pubspec.existsSync() &&
+        lock.existsSync() &&
+        RegExp(r'^workspace:', multiLine: true)
+            .hasMatch(pubspec.readAsStringSync())) {
+      return lock.readAsStringSync();
+    }
+    if (dir.path == dir.parent.path) {
+      throw StateError('no workspace pubspec.lock above '
+          '${Directory.current.path}');
+    }
+  }
 }
 
 /// Stands in for an app plugin that re-registers dart:io's DNS lookup.

@@ -7,6 +7,7 @@ import 'package:path/path.dart' as p;
 import 'package:pub_semver/pub_semver.dart';
 
 import 'config.dart';
+import 'flutter_bridge.dart';
 import 'lint.dart';
 
 /// The result of compiling and packing a patch.
@@ -68,9 +69,15 @@ final class PatchBuilder {
     _rejectPlatformImports(sources);
     _rejectCatchAroundAwait(sources);
 
+    final compiler = Compiler();
+    // Only for a patch that asks for it. Unpacking and registering flutter_eval
+    // costs 800 KB of JSON and 185 declarations, and a patch that repairs a
+    // JSON contract should not pay for a feature it does not use.
+    if (usesFlutter(sources)) registerFlutterBridges(compiler);
+
     final Program program;
     try {
-      program = Compiler().compile(<String, Map<String, String>>{
+      program = compiler.compile(<String, Map<String, String>>{
         'patch': sources,
       });
     } on Object catch (e) {
@@ -214,6 +221,20 @@ final RegExp _tryBlock = RegExp(
 /// — a guard against the honest mistake, not a proof. It errs toward flagging:
 /// any `await` between a `try {` and its closing brace counts, even one that
 /// could not throw.
+///
+/// The asymmetry with [_rejectPlatformImports] is worth stating, because the
+/// two look like the same kind of rule and are not. That one is a lint in front
+/// of a *boundary*: spell the import unusually and the sandbox still refuses
+/// the call at runtime, so defeating the text match buys nothing. This one has
+/// no boundary behind it. Nothing at runtime can tell that a handler was
+/// written, so a patch that slips past this — an `await` reached through a
+/// helper, a `try` this regex fails to pair — publishes with error handling
+/// that silently never runs.
+///
+/// That is the failure this repository treats as the worst kind, so it is
+/// stated rather than papered over: the fix lives in dart_eval, and until it
+/// lands the honest position is that a patch author should not write `catch`
+/// around `await` at all rather than trust a regex to notice.
 void _rejectCatchAroundAwait(Map<String, String> sources) {
   final offenders = <String>[];
   sources.forEach((path, source) {

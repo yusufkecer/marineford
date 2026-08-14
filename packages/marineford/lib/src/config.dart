@@ -11,7 +11,10 @@ import 'transport.dart';
 enum PatchActivation {
   /// Activate as soon as the download is verified.
   ///
-  /// Sound in v1: activation is a dispatch-table swap and measured 0.74ms.
+  /// Sound in v1: activation is a dispatch-table swap and measures ~0.35ms.
+  /// What sits in front of it is larger — verifying the container's signature
+  /// costs ~2.4ms of pure Dart Ed25519 — but that is paid whichever activation
+  /// mode is chosen, so it is not part of this trade.
   /// Functions already executing keep their original body; the next call goes
   /// to the patch.
   immediate,
@@ -28,9 +31,20 @@ enum PatchActivation {
 final class MarinefordConfig {
   /// Creates a [MarinefordConfig].
   ///
-  /// Throws [FormatException] if [abi] is not a well-formed fingerprint. Not
-  /// const, so this validation happens here rather than the first time a patch
-  /// silently fails to match.
+  /// Throws [FormatException] if [abi] is not a well-formed fingerprint, or if
+  /// [manifestUrl] is plaintext `http`. Not const, so this validation happens
+  /// here rather than the first time a patch silently fails to match.
+  ///
+  /// The transport rule is worth stating, because signing looks like it makes
+  /// it unnecessary and it does not. A signature proves the manifest was
+  /// written by the key holder; it proves nothing about *which* manifest you
+  /// were given. Someone on the path who can answer a plaintext request can
+  /// serve an older signed manifest, or answer `304` forever, and the device
+  /// stays on the patch it has — which turns `revoke` from a kill switch into
+  /// a suggestion. TLS is what makes the freshest manifest the one you get.
+  ///
+  /// Set `allowInsecureManifestUrl` to use `http` against a local server while
+  /// developing. It is deliberately awkward to type.
   MarinefordConfig({
     required this.appId,
     required this.appVersion,
@@ -47,7 +61,21 @@ final class MarinefordConfig {
     this.transport,
     this.plugins = const <EvalPlugin>[],
     this.permissions = const <Permission>[],
-  }) : fingerprint = AbiFingerprint.parse(abi);
+    bool allowInsecureManifestUrl = false,
+  }) : fingerprint = AbiFingerprint.parse(abi) {
+    if (!allowInsecureManifestUrl &&
+        !manifestUrl.isScheme('https') &&
+        !manifestUrl.isScheme('file')) {
+      throw FormatException(
+        'manifestUrl must be https, not "${manifestUrl.scheme}". A signature '
+        'proves who wrote a manifest, not that you were handed the newest one '
+        '— over plaintext, anyone on the path can pin a device to an old '
+        'manifest and suppress a revoke indefinitely. Pass '
+        'allowInsecureManifestUrl: true if this is a local development server.',
+        manifestUrl.toString(),
+      );
+    }
+  }
 
   /// Application id. Must match the manifest, or the manifest is ignored.
   final String appId;

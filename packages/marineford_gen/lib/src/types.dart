@@ -49,13 +49,18 @@ final class TypeVerdict {
 
 /// Decides how a type crosses the boundary, or why it cannot.
 ///
-/// The supported set is the JSON-shaped types plus primitives, and `Future` of
-/// any of them as a return type. That is not a placeholder for something more
-/// ambitious — it is the boundary where the generator can be *certain* it is
-/// emitting correct code. Moving an app's own domain object across needs a
-/// dart_eval binding, and guessing at the wrapper class name would produce
-/// shims that compile and then silently fall back at runtime. A build error
-/// naming the problem is worth more than that.
+/// The supported set is the JSON-shaped types plus primitives, `Future` of any
+/// of them as a return type, and Flutter `Widget`s in return position. That is
+/// not a placeholder for something more ambitious — it is the boundary where
+/// the generator can be *certain* it is emitting correct code. Moving an app's
+/// own domain object across needs a dart_eval binding, and guessing at the
+/// wrapper class name would produce shims that compile and then silently fall
+/// back at runtime. A build error naming the problem is worth more than that.
+///
+/// `Widget` is in the set for the opposite reason: flutter_eval already
+/// declares the binding, and the conversion needs no special case at all. Its
+/// wrappers reify to the real widget, so the same `unwrap`-then-test that
+/// carries a `Map` carries a `Column`.
 ///
 /// [isReturn] matters for `Future`, and only for `Future`: a patch can hand one
 /// back, but it cannot await one it was given. It is required rather than
@@ -139,6 +144,27 @@ TypeVerdict classifyType(DartType type, {required bool isReturn}) {
           '${inner.reason}');
     }
     return const TypeVerdict.ok(ArgumentForm.wrapped);
+  }
+
+  if (isFlutterWidget(type)) {
+    if (!isReturn) {
+      return const TypeVerdict.rejected(
+          'a `Widget` parameter cannot cross the patch boundary. A patch '
+          'builds widgets; it cannot be handed one, because passing it in '
+          'would mean wrapping a live element tree the interpreter has no way '
+          'to own. Mark a function that takes the data the widget is built '
+          'from and returns the widget.');
+    }
+    return const TypeVerdict.ok(ArgumentForm.wrapped);
+  }
+
+  if (_isFlutterType(type, 'BuildContext')) {
+    return const TypeVerdict.rejected(
+        'a `BuildContext` cannot cross the patch boundary, so a `build` method '
+        'cannot be marked directly. Mark the function that builds the part you '
+        'want to be able to repair — one that takes the data it needs and '
+        'returns a `Widget` — and call it from `build`. That is the chokepoint '
+        'pattern applied to UI: see the README.');
   }
 
   if (type is FunctionType) {
@@ -243,6 +269,10 @@ List<DartType> _typeArguments(DartType type) =>
 /// element for the life of the patch.
 bool _convertibleArgument(DartType type) {
   if (type is DynamicType || type is VoidType) return true;
+  // `List<Widget>` is the shape a patched section of UI most often takes — the
+  // children of a Column, rebuilt. It converts like any other element: each
+  // one is unwrapped to the real widget and tested with `is`.
+  if (isFlutterWidget(type)) return true;
   if (type.isDartCoreObject ||
       type.isDartCoreInt ||
       type.isDartCoreDouble ||
@@ -261,6 +291,41 @@ bool _convertibleArgument(DartType type) {
     return arguments.length == 1 && arguments.single is DynamicType;
   }
   return false;
+}
+
+/// Where Flutter declares `Widget` and `BuildContext`.
+///
+/// Matched by library URI rather than by depending on Flutter, for the same
+/// reason the annotations are matched that way: `marineford_gen` is a pure Dart
+/// build package, and taking a Flutter dependency would stop it resolving in
+/// one.
+const String _flutterFramework = 'package:flutter/src/widgets/framework.dart';
+
+/// Whether [type] is Flutter's `Widget`, or anything that extends it.
+///
+/// The supertype walk is what makes a declared `Card` return work as well as a
+/// bare `Widget`. The conversion is the same either way: [returnExpression]
+/// emits `valueOf<Card>`, and a patch that hands back something else fails the
+/// `is` test and falls back to the original — the ordinary treatment for a
+/// patch that does not fit its signature.
+///
+/// Nothing here needs flutter_eval to be present. If the app never registers
+/// its plugin the patch simply fails to compile against the Flutter bridges
+/// and never loads, which is the same outcome as any other unbuildable patch.
+bool isFlutterWidget(DartType type) {
+  if (_isFlutterType(type, 'Widget')) return true;
+  if (type is! InterfaceType) return false;
+  for (final supertype in type.allSupertypes) {
+    if (_isFlutterType(supertype, 'Widget')) return true;
+  }
+  return false;
+}
+
+/// Whether [type] is the Flutter framework class called [name].
+bool _isFlutterType(DartType type, String name) {
+  final element = type.element;
+  if (element == null || element.name != name) return false;
+  return element.library?.uri.toString() == _flutterFramework;
 }
 
 /// A type name stable enough to hash into the ABI fingerprint.

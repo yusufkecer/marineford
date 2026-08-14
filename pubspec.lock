@@ -262,6 +262,15 @@ packages:
     description: flutter
     source: sdk
     version: "0.0.0"
+  flutter_eval:
+    dependency: "direct overridden"
+    description:
+      path: "."
+      ref: "832c478efa6085584d90c3e7c5df86b601cb13c9"
+      resolved-ref: "832c478efa6085584d90c3e7c5df86b601cb13c9"
+      url: "https://github.com/yusufkecer/flutter_eval.git"
+    source: git
+    version: "0.8.3"
   flutter_test:
     dependency: transitive
     description: flutter

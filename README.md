@@ -1,36 +1,47 @@
 # marineford
 
-Code push for Flutter, without forking the engine.
+Repair a Flutter app that is already installed — the parts of it you marked as
+repairable before you shipped.
 
-Mark the functions you want to be able to fix later. Ship a signed patch to any
-static host. Repair broken logic on apps that are already installed, without a
-store release.
+Stock engine, stock toolchain, nothing of yours leaving your infrastructure. A
+signed patch on any static host, and an interpreter that only ever runs inside
+branches `@patchable` compiled into your binary. The qualifier in the first
+sentence is the whole trade, and it is not fine print: **code that shipped
+unmarked can never be patched.**
+
+Patching logic needs nothing but this package. Patching UI additionally needs
+[flutter_eval](https://pub.dev/packages/flutter_eval), which does not currently
+compile against Flutter 3.41 and so needs a fork until
+[the fix](https://github.com/ethanblake4/flutter_eval/pull/142) is released —
+the least settled part of this, and worth knowing before you plan around it.
 
 ```dart
 @patchable
 Map<String, dynamic>? _normalizeResponse(String endpoint, Map<String, dynamic>? raw) => raw;
 ```
 
-That one line, shipped in v1.4.0, is enough to absorb almost any change your
-backend makes afterwards.
+One marker there covers most of what a backend does to you afterwards — renamed
+fields, changed status values, a new envelope, a type that moved — because the
+function with the bug never has to be the function you marked. The
+[example app](example/json_drift_app) takes eight response shapes through that
+one function, repairing six and correctly leaving two alone, and repairs the
+card that draws the result from the same patch.
 
 > **Status: pre-release.** Not on pub.dev yet. The pipeline works end to end and
-> is covered by 336 tests; the API may still move before 0.1.0.
+> is covered by 457 tests; the API may still move before 0.1.0.
 
 ---
 
-## Read this before anything else
-
-**Code that was not marked before it shipped can never be patched.**
+## Why marking, and why it is survivable
 
 marineford does not fork the Dart compiler, so it cannot add a branch to machine
 code that is already compiled. `@patchable` inserts that branch at build time
-and nowhere else. If you ship v1.4.0 without marking a function, fixing that
+and nowhere else. Ship v1.4.0 without marking a function and fixing that
 function means a store release — and only builds from that release onward will
 be patchable.
 
-This is the whole trade for not forking the engine. Three things make it
-workable, and understanding them is most of understanding the library:
+That is the cost. Three things make it a price worth paying, and understanding
+them is most of understanding the library:
 
 1. **Mark above the bug, not on it.** A patch replaces the marked function's
    entire body, so it can also repair bugs in the unmarked helpers that function
@@ -50,6 +61,23 @@ workable, and understanding them is most of understanding the library:
 If pre-marking is unacceptable to you, [Shorebird](https://shorebird.dev)
 patches everything with no annotations. It forks the Flutter engine and the Dart
 compiler to do it. See [Compared with Shorebird](#compared-with-shorebird).
+
+## When not to use this
+
+marineford is for repairing something that is broken, on builds already in
+users' hands. Several problems look like that and are not:
+
+| You want to | Use |
+|---|---|
+| Change a value, threshold, copy string or feature flag | Remote Config. It is simpler, instant, and needs no signing key. |
+| Change the shape of an API response | Your backend. Fix it at the source; a patch is what you reach for when you cannot. |
+| Ship a screen the reviewed build never had | A store release. See [Store policy](#store-policy). |
+| Fix a bug in code nobody marked | A store release. Nothing can help — this is the trade. |
+| A/B test a layout | A feature flag around code you shipped. |
+
+The case marineford is built for is narrower and sharper than any of those: a
+crash, a mis-parse, a screen showing the wrong thing — found after release,
+where waiting days for review is the actual cost.
 
 ---
 
@@ -385,9 +413,11 @@ and then silently falls back.
 | nullable versions of all the above | yes |
 | `void` return | yes |
 | `Future<T>` return, for any `T` above | yes |
+| `Widget` return, and `List<Widget>` | yes — see [Patching UI](#patching-ui) |
 | your own classes | **no** — build error |
 | `Stream`, `FutureOr` | **no** — build error |
 | `Future` as a *parameter* | **no** — build error |
+| `Widget` or `BuildContext` as a *parameter* | **no** — build error |
 | function types / callbacks | **no** — build error |
 | named or optional parameters | **no** — build error |
 
@@ -418,7 +448,11 @@ errors:
 
 * **`try`/`catch` around an `await` does not work.** The catch frame is dropped
   at the suspension point, so a handler written after an `await` never runs.
-  `marineford build` refuses a patch that contains one.
+  `marineford build` refuses a patch that contains one — but that refusal reads
+  the source text, and unlike the `dart:io` rule there is no runtime boundary
+  behind it. A patch that slips past the check publishes with error handling
+  that silently does nothing. Treat it as a rule to follow, not a net to lean
+  on: do not write `catch` around `await` in a patch.
 * **The `Future` surface is small.** Interpreted code gets `Future.delayed` and
   `.then`. There is no `Future.wait`, `Future.value`, `catchError`,
   `whenComplete` or `timeout`, and `async*` / `sync*` / `await for` are not
@@ -429,6 +463,81 @@ down for the session. dart_eval does not restore its frame bookkeeping when an
 async call unwinds, so the runtime is not trustworthy afterwards — every marked
 function goes back to its original body rather than spending more calls on it.
 The next launch starts clean.
+
+### Patching UI
+
+A function returning a `Widget` is patchable, so a screen that renders the
+wrong thing can be repaired the same way a parser can.
+
+```dart
+@patchable
+Widget _collectDayCard(Map<String, dynamic> data) => Card(/* ... */);
+```
+
+and in the patch:
+
+```dart
+@RuntimeOverride(
+  'pkg:app/lib/collect_day_screen.dart#collectDayCard',
+  version: '>=1.4.0 <1.5.0',
+)
+Widget card(Map data) => Card(/* the corrected arrangement */);
+```
+
+**`build` itself cannot be marked**, because a `BuildContext` cannot cross the
+boundary. That restriction earns its keep: it forces the marker onto a function
+whose inputs are data, which is the only kind a patch can be handed. Mark the
+function that builds the part you want to repair, and call it from `build`.
+This is the chokepoint pattern again — one marked builder per screen region
+covers everything drawn inside it.
+
+**Turn it on** by registering [flutter_eval](https://pub.dev/packages/flutter_eval),
+which provides the Flutter bindings the interpreter needs:
+
+```dart
+MarinefordConfig(
+  // ...
+  plugins: const [flutterEvalPlugin],
+)
+```
+
+Nothing in `marineford` depends on flutter_eval, so an app that only patches
+logic never links it. The CLI does not need it either — it compiles patches
+from bundled declarations and stays pure Dart, which is what keeps
+`dart pub global activate` working.
+
+> **You need a fork today.** flutter_eval 0.8.2 does not compile against
+> current Flutter — `$Container` implements `Container` without its
+> `isAntiAlias` field. The fix is one line and is open upstream as
+> [flutter_eval#142](https://github.com/ethanblake4/flutter_eval/pull/142).
+> Until it is released, add a `dependency_overrides` entry pointing at a fork
+> that carries it. Only apps patching UI are affected.
+
+#### What it costs
+
+An interpreted card build — `Card` > `Padding` > `Column` with text, a row and
+a button — measures **20µs** against **3µs** for the same tree built natively.
+That is **0.12%** of a 60fps frame; about 820 of them would fill one.
+
+The rule that follows: **patch a screen or a section, never a list row.** A
+handful of patched regions per screen is free in practice. A marked builder
+called once per item in a long list is not, and the difference is three orders
+of magnitude, not a few percent.
+
+#### What a patch can draw
+
+flutter_eval's bindings, not all of Flutter. `Scaffold`, `AppBar`, `Card`,
+`ListTile`, `Column`, `Row`, `Padding`, `Container`, `Stack`, `Text`,
+`TextField`, `ElevatedButton`, `TextButton`, `IconButton`, `Image`,
+`GestureDetector`, `InkWell`, `Navigator`, `Theme` and the painting types
+around them are covered. Anything outside that fails at `marineford build`
+with the name of what it could not resolve — a build error, not a surprise on
+a device.
+
+The sandbox is unchanged and still holds: `Image.network`, `Image.asset` and
+platform channels are all permission-gated, marineford grants nothing, and a
+patch that reaches for one fails and falls back like any other patch bug.
+There are tests for each.
 
 ---
 
@@ -479,6 +588,26 @@ marineford rollout <n>       Change a patch's staged rollout percentage
 marineford revoke <n> [n...] Revoke patches so devices roll back
 marineford doctor            Check the project is ready to publish
 ```
+
+`revoke` is the one command with no undo — the revoked list only grows — so it
+takes a `--dry-run`, which writes nothing and prints where devices would land:
+
+```
+$ marineford revoke 2 --dry-run 1.4.0
+Revoking #2 on prod — dry run, nothing is written.
+Simulated for app 1.4.0, with every device inside the rollout.
+
+  device on     becomes
+  ---------     -------
+  nothing       #1
+  #1            unchanged (#1)
+  #2            #1
+```
+
+It takes an app version because the answer depends on one: a patch constrained
+to `<1.5.0` is not a fallback for a device on 1.5.0. If the patch devices would
+fall back to is itself on a staged rollout, the preview says so — the table is
+optimistic in exactly that case.
 
 `marineford.yaml`:
 
@@ -587,11 +716,33 @@ dart compile exe bench/bin/run.dart -o bench/run && ./bench/run
 | Crossing into the interpreter | **~2.6 µs** fixed |
 | Interpreted loop iteration | **~110 ns** |
 | Realistic JSON normaliser call | **~3.4 µs** |
-| Activating a patch at startup | **~1 ms** |
+| Handing a 50-row payload to a patch | **~0.06 µs** |
+| Verifying one Ed25519 signature | **~2.4 ms** |
+| Swapping the dispatch table | **~0.35 ms** |
 | A small patch on the wire | **~3.5 KB** gzipped |
 
 At 60fps you have 16,666 µs per frame — room for roughly 500 boundary crossings.
 That is a lot for screen-level logic and very little for anything per-item.
+
+Payloads are handed across as views rather than copies, which is why the fifth
+row is what it is — it used to be **35 µs**, thirteen crossings' worth of
+copying done before the patch read its first field. A patch sees an entry when
+it asks for one. Writing through a view copies first, so a patch still cannot
+reach back into your data.
+
+**Startup is dominated by signature verification, not by anything marineford
+does.** `Marineford.init` re-verifies the stored patch on every launch, so it
+costs about **2.8 ms** — 2.4 of that is Ed25519. Call `checkForUpdate()` during
+startup too, as the quick start does, and the manifest's signature makes it
+about **5.2 ms**. An earlier version of this table said "~1 ms" for startup;
+that was the table swap alone, with the verification it sits behind left out.
+
+`cryptography` falls back to a pure Dart Ed25519 unless
+[`cryptography_flutter`](https://pub.dev/packages/cryptography_flutter) is
+present to hand it to the platform. marineford does not depend on that — it
+would make this package carry native code, which is most of what "works
+anywhere Dart runs" is worth. Add it to your app if 2.4 ms on the launch path
+matters more to you than that does; nothing here needs to change.
 
 ---
 
@@ -633,14 +784,36 @@ grants it explicitly and narrowly. Granting widens what a stolen key is worth.
 
 ### Store policy
 
-Apple's developer agreement allows downloading interpreted code that does not
-change the app's primary purpose — the same clause Shorebird relies on for iOS.
-Google Play's Device and Network Abuse policy exempts code running in an
-interpreter; what it forbids is downloading `dex`, `so` or `jar`. `.mfp`
-payloads are dart_eval bytecode and no native code is downloaded at any point.
+Read this yourself rather than taking anyone's summary, including this one.
 
-Staying inside "does not change the primary purpose" is your call, not the
-library's.
+**What is true about the payload.** `.mfp` files are dart_eval bytecode. No
+native code is downloaded at any point — no `dex`, `so`, `jar` or dylib — and
+Google Play's Device and Network Abuse policy draws its line exactly there: it
+forbids downloading executable code and exempts code that runs in an
+interpreter.
+
+**What is true about capability.** The type boundary is not a policy, it is a
+mechanism. A patch is handed JSON-shaped values and widgets and can reach
+nothing else: no file system, no sockets, no processes, no DNS, no platform
+channels. It cannot add a feature the shipped binary could not already perform,
+because there is no surface through which to add one. That is a stronger claim
+than "we intend to only fix bugs", and it is testable — there are tests.
+
+**What is not settled.** Apple is the awkward one. The interpreted-code
+exception in the Developer Program License Agreement is scoped to code run by
+WebKit or JavaScriptCore, which dart_eval is not, and App Review Guideline
+2.5.2 asks whether downloaded code "introduces or changes features or
+functionality". An earlier version of this section said the agreement allows
+interpreted code that does not change the app's primary purpose; that dropped
+the scoping and read as more permission than the text gives.
+
+Patching UI makes this judgement matter more, not less. What marineford is for
+is repairing a screen that is already wrong — the same card, arranged
+correctly. Shipping screens the reviewed build never had is a different thing,
+and the guidelines are aimed at it.
+
+Whether your patch stays on the right side of that line is your call. Nothing
+in this library can make it for you.
 
 ---
 
@@ -652,8 +825,9 @@ library's.
 | [`marineford_core`](packages/marineford_core) | Pure Dart. Manifest, `.mfp` container, signatures, patch selection, rollout bucketing. Shared by the runtime and the CLI so both sides agree on the rules. |
 | [`marineford_gen`](packages/marineford_gen) | `build_runner` generator for the dispatch shims and the ABI fingerprint. |
 | [`marineford_cli`](packages/marineford_cli) | The `marineford` command. |
-| [`example/json_drift_app`](example/json_drift_app) | One marked function repairing eight backend changes, end to end. |
+| [`example/json_drift_app`](example/json_drift_app) | One marked function repairing eight backend changes, and one marked builder repairing the card that draws the result — end to end, from one patch. |
 | [`bench`](bench) | The cost model the design is argued from. |
+| [`tool/bridge_dump`](tool/bridge_dump) | Regenerates the Flutter bridge declarations the CLI compiles against. The only thing here that depends on flutter_eval, kept out of the workspace so an upstream break cannot stop the rest building. |
 
 ---
 
@@ -668,18 +842,24 @@ in your app, including code nobody thought to mark.
 |---|---|---|
 | Marking | none | required, ahead of time |
 | Dart language coverage | 100% | dart_eval's subset |
+| UI | any widget | flutter_eval's bindings, from a marked builder |
 | Engine | forked | stock |
 | Flutter versions | only what Shorebird supports | any |
 | Platforms | Android + iOS | anywhere Dart runs |
 | Self-host | not offered | your own CDN |
-| Cost | per patch install | none |
+| Cost | per patch install | hosting only |
 | Native code / plugins | cannot patch | cannot patch |
 
 If you target Android and iOS, are happy to stay on the Flutter versions
 Shorebird supports, and do not mind a subscription and a vendor, Shorebird is
-the better product. marineford is a different trade: no fork, no vendor, no
-cost, works anywhere Dart runs, and the entire pipeline is yours — paid for with
-the marking requirement and a language subset.
+the better product. It patches code nobody marked, which is the thing marineford
+structurally cannot do.
+
+marineford is a different trade: stock engine, no vendor, works anywhere Dart
+runs, and the whole pipeline is yours — nothing leaves your infrastructure and
+nobody else sees your code. Paid for with the marking requirement and a language
+subset. The cost difference is smaller than it looks once you are hosting files
+somewhere anyway; what actually differs is control.
 
 ---
 

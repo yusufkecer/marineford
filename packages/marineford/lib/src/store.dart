@@ -213,8 +213,13 @@ final class PatchStore {
     return state;
   }
 
+  /// The state file as decoded JSON, or null if there is not one to read.
+  ///
+  /// No existence check: `readAsString` throws when the file is missing, and
+  /// that is already caught below. Asking first costs a second syscall and
+  /// answers a question the read is about to answer anyway — and between the
+  /// two the file could be gone regardless.
   Future<Map<String, Object?>?> _readJsonOrNull() async {
-    if (!_stateFile.existsSync()) return null;
     try {
       final decoded = jsonDecode(await _stateFile.readAsString());
       return decoded is Map<String, Object?> ? decoded : null;
@@ -225,10 +230,30 @@ final class PatchStore {
   }
 
   /// Persists [state], creating the directory if needed.
-  Future<void> writeState(PatchState state) async {
-    await root.create(recursive: true);
-    await _writeAtomic(_stateFile, utf8.encode(jsonEncode(state.toJson())));
+  ///
+  /// Serialised against every other state write, because they are not all
+  /// awaited by whoever starts them. The boot-confirmation timer fires
+  /// `markBootSuccessful` unawaited, the dispatcher abandons a patch from
+  /// inside interpreted code and cannot wait for a disk write, and
+  /// `checkForUpdate` runs on its own. Two of those overlapping used to write
+  /// the same temporary file and then race to rename it: one rename won, the
+  /// other threw, and the bytes in between were whichever interleaving got
+  /// there first.
+  Future<void> writeState(PatchState state) {
+    final bytes = utf8.encode(jsonEncode(state.toJson()));
+    final next = _stateWrites.then((_) async {
+      await root.create(recursive: true);
+      await _writeAtomic(_stateFile, bytes);
+    });
+    // The chain has to survive a failed write, or one bad disk moment stops
+    // every later write from being attempted. The error still reaches the
+    // caller through `next`.
+    _stateWrites = next.then((_) {}, onError: (Object _) {});
+    return next;
   }
+
+  /// Tail of the state-write chain. See [writeState].
+  Future<void> _stateWrites = Future<void>.value();
 
   /// Writes a verified patch container to disk.
   ///
@@ -243,7 +268,6 @@ final class PatchStore {
   /// Reads a stored patch, or null if it is not there or cannot be read.
   Future<Uint8List?> readPatch(int number) async {
     final file = _patchFile(number);
-    if (!file.existsSync()) return null;
     try {
       return await file.readAsBytes();
     } on FileSystemException {
@@ -253,28 +277,32 @@ final class PatchStore {
 
   /// Deletes a stored patch if present.
   Future<void> deletePatch(int number) async {
-    final file = _patchFile(number);
-    if (file.existsSync()) {
-      try {
-        await file.delete();
-      } on FileSystemException {
-        // A patch we cannot delete is a disk problem, not a correctness one:
-        // selection ignores files, it goes by state.
-      }
+    try {
+      await _patchFile(number).delete();
+    } on FileSystemException {
+      // Missing or undeletable, and neither is a correctness problem: selection
+      // goes by state, not by what is on disk.
     }
   }
 
   /// Patch numbers currently on disk, highest first.
+  ///
+  /// An absent directory is the ordinary state before the first install, and
+  /// `list()` reports it the same way it reports a permission problem — as a
+  /// `FileSystemException`. Both mean the same thing here: nothing to offer.
   Future<List<int>> storedPatches() async {
-    if (!_patchDir.existsSync()) return const <int>[];
     final numbers = <int>[];
-    await for (final entity in _patchDir.list()) {
-      if (entity is! File) continue;
-      final name = p.basenameWithoutExtension(entity.path);
-      final number = int.tryParse(name);
-      if (number != null && p.extension(entity.path) == '.mfp') {
-        numbers.add(number);
+    try {
+      await for (final entity in _patchDir.list()) {
+        if (entity is! File) continue;
+        final name = p.basenameWithoutExtension(entity.path);
+        final number = int.tryParse(name);
+        if (number != null && p.extension(entity.path) == '.mfp') {
+          numbers.add(number);
+        }
       }
+    } on FileSystemException {
+      return const <int>[];
     }
     numbers.sort((a, b) => b.compareTo(a));
     return numbers;
@@ -303,12 +331,10 @@ final class PatchStore {
 
   /// Deletes everything. Used when the state is beyond repair.
   Future<void> clear() async {
-    if (root.existsSync()) {
-      try {
-        await root.delete(recursive: true);
-      } on FileSystemException {
-        // Best effort.
-      }
+    try {
+      await root.delete(recursive: true);
+    } on FileSystemException {
+      // Missing or undeletable. Best effort either way.
     }
   }
 
@@ -319,9 +345,33 @@ final class PatchStore {
 
   /// Writes via a temporary file and renames, so an interrupted write leaves
   /// the previous content rather than a half-file.
+  /// One temporary name per target, reused.
+  ///
+  /// A unique suffix per write looks safer and is worse: nothing sweeps these,
+  /// so a process killed between the write and the rename orphans a file no
+  /// later write will ever reuse, and a device that is force-killed often
+  /// accumulates them without bound. `storedPatches` will not even notice —
+  /// it filters on the `.mfp` extension and these end in `.part`.
+  ///
+  /// A fixed name is bounded at one file per target and the next write reclaims
+  /// it. What makes that safe is that no two writers share a target: state
+  /// writes are serialised through [writeState]'s chain, and a patch file is
+  /// named after a number that is downloaded once.
   Future<void> _writeAtomic(File file, List<int> bytes) async {
     final temp = File('${file.path}.part');
-    await temp.writeAsBytes(bytes, flush: true);
-    await temp.rename(file.path);
+    try {
+      await temp.writeAsBytes(bytes, flush: true);
+      await temp.rename(file.path);
+    } on Object {
+      // A partial temporary file left behind would be collected as debris and
+      // never read, but it would still be there. Rename is the last step, so
+      // reaching here usually means it is still called `.part`.
+      try {
+        await temp.delete();
+      } on FileSystemException {
+        // Already gone, or undeletable. Neither changes the failure below.
+      }
+      rethrow;
+    }
   }
 }

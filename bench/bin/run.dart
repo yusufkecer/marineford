@@ -2,10 +2,12 @@ import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:dart_eval/dart_eval.dart';
 import 'package:dart_eval/dart_eval_bridge.dart';
 import 'package:dart_eval/stdlib/core.dart';
+import 'package:marineford_core/marineford_core.dart';
 import 'package:pub_semver/pub_semver.dart';
 
 /// Reproduces the numbers marineford's design is argued from.
@@ -55,6 +57,7 @@ Future<void> main(List<String> args) async {
   results.addAll(_dispatchCosts());
   results.addAll(await _interpreterCosts());
   results.addAll(_jsonBridgeCosts());
+  results.addAll(await _signatureCosts());
   results.addAll(_patchSizes());
 
   stdout.writeln('');
@@ -160,8 +163,14 @@ int? _cachedSlot;
 
 /// The same shim with its lookup cached against the generation counter.
 ///
-/// This is what a `@PatchableService` method already does — the question this
-/// measures is whether a top-level function should do it too.
+/// This is what a `@PatchableService` method does — the question this measures
+/// is whether a top-level function should do it too.
+///
+/// Worth knowing that this comment was wrong for a while, and in the direction
+/// that flatters the number. The generated service kept these fields on the
+/// instance, so every new object started at generation -1 and paid a lookup
+/// per method on its first call, while this models them as top-level statics.
+/// They are static in the generated code now, so the two agree.
 int _cachedShim(int a, int b) {
   if (_cachedGeneration != _generation) {
     _cachedGeneration = _generation;
@@ -318,22 +327,125 @@ String parse(Map response) {
 ///
 /// Copied rather than imported: the runtime package depends on Flutter and this
 /// one deliberately does not, so a `flutter test` harness is not sitting between
-/// the stopwatch and the code. Keep it in step with `json_bridge.dart`.
+/// the stopwatch and the code.
+///
+/// A copy is a thing that goes stale, and this one did. It kept measuring an
+/// eager deep copy for a while after the library stopped doing that, which is
+/// the worst way for a benchmark to be wrong — it reported a cost nobody paid
+/// any more and the number looked plausible. Keep it in step with
+/// `json_bridge.dart`; [_eagerWrap] is retained beside it as the baseline the
+/// lazy form is argued against.
 Object? _wrap(Object? value) {
-  if (value == null) return $null();
+  if (value == null) return const $null();
+  if (value is String) return $String(value);
+  if (value is int) return $int(value);
+  if (value is double) return $double(value);
+  if (value is bool) return $bool(value);
+  if (value is List) return $List.wrap(_BenchLazyList(value));
+  if (value is Map) return $Map.wrap(_BenchLazyMap(value));
+  return value;
+}
+
+/// What [_wrap] used to do: copy the whole payload before the patch reads it.
+///
+/// Kept so the comparison can be measured rather than asserted. On a fifty-row
+/// response this was ~31µs whatever the patch went on to touch; the lazy form
+/// is ~0.4µs for a normaliser that reads two keys, ~9µs if it reads one field
+/// of every row, and level with this one only if it reads every field of every
+/// row — which is to say it never loses.
+Object? _eagerWrap(Object? value) {
+  if (value == null) return const $null();
   if (value is String) return $String(value);
   if (value is int) return $int(value);
   if (value is double) return $double(value);
   if (value is bool) return $bool(value);
   if (value is List) {
-    return $List.wrap(<Object?>[for (final item in value) _wrap(item)]);
+    return $List.wrap(<Object?>[for (final item in value) _eagerWrap(item)]);
   }
   if (value is Map) {
     return $Map.wrap(<Object?, Object?>{
-      for (final e in value.entries) _wrap(e.key): _wrap(e.value),
+      for (final e in value.entries) _eagerWrap(e.key): _eagerWrap(e.value),
     });
   }
   return value;
+}
+
+/// Copy of `_LazyMap` from `json_bridge.dart`. See [_wrap].
+final class _BenchLazyMap extends MapBase<Object?, Object?> {
+  _BenchLazyMap(this._plain);
+
+  final Map<Object?, Object?> _plain;
+  final Map<Object?, Object?> _wrapped = <Object?, Object?>{};
+  Map<Object?, Object?>? _owned;
+
+  static Object? _plainKey(Object? key) => key is $Value ? key.$reified : key;
+
+  @override
+  Object? operator [](Object? key) {
+    final owned = _owned;
+    if (owned != null) return owned[key];
+    final plainKey = _plainKey(key);
+    final existing = _wrapped[plainKey];
+    if (existing != null) return existing;
+    if (!_plain.containsKey(plainKey)) return null;
+    return _wrapped[plainKey] = _wrap(_plain[plainKey]);
+  }
+
+  @override
+  void operator []=(Object? key, Object? value) => _materialise()[key] = value;
+
+  @override
+  Object? remove(Object? key) => _materialise().remove(key);
+
+  @override
+  void clear() => _materialise().clear();
+
+  @override
+  Iterable<Object?> get keys => _owned?.keys ?? _plain.keys.map(_wrap);
+
+  @override
+  int get length => _owned?.length ?? _plain.length;
+
+  @override
+  bool containsKey(Object? key) =>
+      _owned?.containsKey(key) ?? _plain.containsKey(_plainKey(key));
+
+  Map<Object?, Object?> _materialise() => _owned ??= <Object?, Object?>{
+        for (final entry in _plain.entries)
+          _wrap(entry.key): _wrapped[entry.key] ?? _wrap(entry.value),
+      };
+}
+
+/// Copy of `_LazyList` from `json_bridge.dart`. See [_wrap].
+final class _BenchLazyList extends ListBase<Object?> {
+  _BenchLazyList(this._plain);
+
+  final List<Object?> _plain;
+  final Map<int, Object?> _wrapped = <int, Object?>{};
+  List<Object?>? _owned;
+
+  @override
+  int get length => _owned?.length ?? _plain.length;
+
+  @override
+  set length(int value) => _materialise().length = value;
+
+  @override
+  Object? operator [](int index) {
+    // Not `_owned?[index] ?? ...`: once materialised, an element that is
+    // legitimately null would fall through to the lazy branch and answer with
+    // the pre-write value — or read out of range, if `length=` shrank the list.
+    final owned = _owned;
+    if (owned != null) return owned[index];
+    return _wrapped[index] ??= _wrap(_plain[index]);
+  }
+
+  @override
+  void operator []=(int index, Object? value) => _materialise()[index] = value;
+
+  List<Object?> _materialise() => _owned ??= <Object?>[
+        for (var i = 0; i < _plain.length; i++) _wrapped[i] ?? _wrap(_plain[i]),
+      ];
 }
 
 /// A copy of `MarinefordJson.unwrap`.
@@ -588,27 +700,6 @@ Map<String, dynamic>? _unwrapMapTwice(Object? value) {
 /// subclass — it has to be the map handed to `$Map.wrap`, doing the key
 /// translation itself, which is why only `[]` is implemented here. A real one
 /// would owe the whole `Map` interface.
-final class _LazyView extends MapBase<Object?, Object?> {
-  _LazyView(this._source);
-
-  final Map<String, Object?> _source;
-
-  @override
-  Object? operator [](Object? key) {
-    final plain = key is $String ? key.$value : key;
-    return _wrap(_source[plain]);
-  }
-
-  @override
-  void operator []=(Object? key, Object? value) => throw UnimplementedError();
-  @override
-  void clear() => throw UnimplementedError();
-  @override
-  Iterable<Object?> get keys => _source.keys.map(_wrap);
-  @override
-  Object? remove(Object? key) => throw UnimplementedError();
-}
-
 /// Prices the deep copy that every marked call with a JSON payload pays.
 ///
 /// The design wraps eagerly on the assumption that this is small next to the
@@ -617,20 +708,23 @@ final class _LazyView extends MapBase<Object?, Object?> {
 /// 5 keys costs 421ns, 50 costs 3.3µs — the crossing itself — and 50 rows of 8
 /// fields costs 35µs, thirteen crossings.
 ///
-/// The break-even below makes the same point from the other side. Eager wrapping
-/// buys 2ns per key read for 3.3µs down, so it only pays off after ~1700 reads
-/// of the same map, and a normaliser reads a handful. **A lazy view would be
-/// cheaper for every payload anyone actually patches.**
+/// This is history now: the eager copy was replaced by the lazy views the
+/// break-even below argued for, and [_eagerWrap] is kept only so the comparison
+/// stays measurable rather than remembered.
 ///
-/// It is not built, and the reason is not this number. `_LazyView` below
-/// explains it: dart_eval reaches past `$Map.operator []` into `$value`, so a
-/// lazy view has to *be* the backing map and owe the whole `Map` interface,
-/// with key translation in every method. One method that forgets returns wrong
-/// data silently, which is the failure the deep copy exists to make impossible.
-/// Against that, 35µs once per HTTP response is not worth buying.
+/// The objection that held it back for a while was real and had to be answered
+/// rather than waved off. dart_eval reaches past `$Map.operator []` into
+/// `$value`, so a lazy view has to *be* the backing map and owe the whole `Map`
+/// interface with key translation in every method — and one method that forgets
+/// returns wrong data silently, which is the failure the deep copy made
+/// impossible by construction. What answered it was `MapBase`, which derives
+/// the whole interface from four methods, plus tests that pin the behaviour a
+/// view makes newly possible: writing through it must copy, because the
+/// interpreter now holds the caller's own structure.
 ///
-/// Revisit if a payload-heavy function is ever marked on a hot path — that is
-/// the condition under which this trade flips, and it is the only one.
+/// The payoff: a normaliser reading two keys of a fifty-row response went from
+/// ~31µs to ~0.4µs. Reading one field of every row is ~9µs. Reading every field
+/// of every row is level with the eager copy — so there is no shape that lost.
 ///
 /// Measured at the entry points the generator actually emits, in both
 /// directions, because the return path is where the cost concentrates.
@@ -668,8 +762,8 @@ List<_Result> _jsonBridgeCosts() {
   // the eager copy does.
   final flat = wide as Map<String, Object?>;
   final probe = $String('field_7');
-  final lazy = $Map.wrap(_LazyView(flat));
-  final eager = _wrap(flat) as $Map;
+  final lazy = $Map.wrap(_BenchLazyMap(flat));
+  final eager = _eagerWrap(flat) as $Map;
 
   // Both probes must actually find something. A lookup that misses is the
   // failure this whole file exists to prevent — $String keys against plain
@@ -719,10 +813,7 @@ List<_Result> _jsonBridgeCosts() {
 
 List<_Result> _patchSizes() {
   stdout.writeln('Measuring patch size...');
-  final program = Compiler().compile(<String, Map<String, String>>{
-    'bench': <String, String>{'main.dart': _source},
-  });
-  final evc = program.write();
+  final evc = _benchBytecode();
   final packed = gzip.encode(evc);
 
   return <_Result>[
@@ -731,3 +822,88 @@ List<_Result> _patchSizes() {
     _Result('compression ratio', evc.length / packed.length, 'x'),
   ];
 }
+
+/// What the launch path actually pays to trust a patch.
+///
+/// The README says activating a patch at startup costs about a millisecond, and
+/// that claim rests on this: `MarinefordClient.start` verifies a signature on
+/// the UI isolate before it will run anything. `cryptography` resolves `Ed25519`
+/// to its pure Dart implementation unless `cryptography_flutter` is present to
+/// hand it to the platform, and this repository does not depend on that — so
+/// what is measured here is what ships.
+///
+/// Two signatures per launch, not one: the manifest and the patch container.
+/// Both are on the path before the first frame.
+///
+/// The message size barely matters — Ed25519 hashes the message and then does
+/// fixed-cost curve arithmetic — so a small and a large payload are measured
+/// together to show that, rather than leaving a reader to wonder whether the
+/// number scales with the patch.
+Future<List<_Result>> _signatureCosts() async {
+  stdout.writeln('Measuring signature verification...');
+
+  final signer = await PatchSigner.generate();
+  final verifier = PatchVerifier.fromBase64(signer.publicKeyBase64);
+
+  final manifest = Uint8List.fromList(utf8.encode(jsonEncode(<String, Object?>{
+    'schema': 1,
+    'appId': 'com.example.app',
+    'channel': 'prod',
+    'sequence': 12,
+    'generatedAt': '2026-01-01T00:00:00.000Z',
+    'patches': <Object?>[
+      for (var i = 0; i < 8; i++)
+        <String, Object?>{
+          'number': i,
+          'url': '$i.mfp',
+          'size': 3600,
+          'sha256': 'a' * 64,
+          'abi': 'sha256:${'b' * 64}',
+          'runtime': '>=1.0.0 <2.0.0',
+          'rollout': 1.0,
+        },
+    ],
+    'revoked': <int>[],
+  })));
+  final container = Uint8List.fromList(gzip.encode(_benchBytecode()));
+
+  final manifestSignature = await signer.sign(manifest);
+  final containerSignature = await signer.sign(container);
+
+  // Both must actually verify. A benchmark that measures a rejection measures
+  // the early-exit path, which is much cheaper and would flatter the number.
+  if (!await verifier.verify(manifest, manifestSignature) ||
+      !await verifier.verify(container, containerSignature)) {
+    throw StateError('the benchmark is measuring a failed verification');
+  }
+
+  final manifestNs = await _timeNsAsync(
+      200, () => verifier.verify(manifest, manifestSignature));
+  final containerNs = await _timeNsAsync(
+      200, () => verifier.verify(container, containerSignature));
+
+  return <_Result>[
+    _Result(
+        'verify a manifest (${manifest.length} B)', manifestNs / 1000000, 'ms',
+        budget: 8),
+    _Result('verify a container (${(container.length / 1024).round()} KB)',
+        containerNs / 1000000, 'ms',
+        budget: 8),
+    _Result('both, as a launch pays them', (manifestNs + containerNs) / 1000000,
+        'ms',
+        budget: 16),
+  ];
+}
+
+/// The benchmark patch, compiled once.
+///
+/// Two sections want these bytes — one to sign, one to measure packed — and
+/// compiling twice cost the run a second compile of the same source. That is
+/// 2ms under AOT and 246ms under the JIT by this file's own header, which is
+/// the mode the header tells people to use for a quick look.
+Uint8List? _benchBytecodeCache;
+
+Uint8List _benchBytecode() =>
+    _benchBytecodeCache ??= Compiler().compile(<String, Map<String, String>>{
+      'bench': <String, String>{'main.dart': _source},
+    }).write();

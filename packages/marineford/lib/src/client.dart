@@ -188,17 +188,34 @@ final class MarinefordClient {
     final MfpContainer container;
     try {
       container = MfpContainer.parse(bytes);
+    } on UnsupportedFlagsException catch (e) {
+      // Refused, not condemned. This is the forward-compatibility hatch: the
+      // patch is well-formed and uses something this build does not know about
+      // yet. Blocklisting it made the hatch a trap — the blocklist is permanent
+      // and nothing clears it, so a device that met a v2 patch once would still
+      // be refusing that patch number after a store update to the build that
+      // understands it.
+      _emit(PatchRejectedEvent(number, e.message));
+      await _forgetBootAttempt(number);
+      return null;
     } on MarinefordFormatException catch (e) {
+      // Everything else here is a malformed file, which is a fact about the
+      // bytes rather than about this build. It will never become valid.
       await _blocklist(state, number, e.message);
       return null;
     }
 
     if (container.abi != config.fingerprint) {
-      await _blocklist(
-          state,
+      // Also not condemned, for the same reason. Selection already filters on
+      // the manifest's ABI, so this is reached for a patch on disk after a
+      // store update changed the fingerprint — an ordinary state, not a bad
+      // patch. Blocklisting it would fill the set with old patch numbers and
+      // conflate "crashed twice" with "not built for this binary".
+      _emit(PatchRejectedEvent(
           number,
           'built against ABI ${container.abi}, this build is '
-          '${config.fingerprint}');
+          '${config.fingerprint}'));
+      await _forgetBootAttempt(number);
       return null;
     }
 
@@ -319,8 +336,28 @@ final class MarinefordClient {
     _confirmTimer = null;
     final current = _state;
     if (current == null || current.booting == null) return;
+
+    // A patch that was activated and is no longer dispatching gave up during
+    // this launch, and this boot is not the healthy one the token is waiting
+    // for. Confirming anyway is how an async patch became immortal: the first
+    // async failure drops the patch for the session and resets the failure
+    // count in the same breath, so the runtime threshold can never be reached,
+    // and clearing the token here meant the crash-loop guard never saw
+    // anything either. Leaving the token is what lets the existing guard
+    // count the launches and blocklist after maxBootAttempts.
+    if (_activeNumber != null && !Patch.isActive) return;
+
     _state = current.copyWith(clearBooting: true, bootAttempts: 0);
-    await _store.writeState(_state!);
+    try {
+      await _store.writeState(_state!);
+    } on Object catch (error, stackTrace) {
+      // The auto-confirm path calls this from a timer with no one awaiting it,
+      // so an exception here is an unhandled async error in the app's zone —
+      // from a library whose whole promise is that it cannot take the app
+      // down. The cost of swallowing it is a boot token left on disk, which
+      // costs one attempt against the crash-loop budget next launch.
+      _emit(PatchCheckFailed(error, stackTrace));
+    }
   }
 
   /// Checks the manifest and installs whatever the rules allow.
@@ -431,9 +468,67 @@ final class MarinefordClient {
     return decision;
   }
 
+  /// Drops the boot token written for [number] before it was opened.
+  ///
+  /// `_activateStored` writes the token first on purpose — a payload that
+  /// inflates past what the device can hold is killed by the OS, and an OOM
+  /// runs no catch block, so the attempt has to be on disk before the
+  /// dangerous part. That ordering assumed whatever refused the patch would
+  /// clear the token on its way out, which `_blocklist` did.
+  ///
+  /// The two refusals that are *not* blocklists — a flag this build does not
+  /// know, an ABI from a different binary — therefore left the token behind,
+  /// and the crash-loop guard blocklisted the patch a couple of launches later
+  /// with `failed to boot N times`. That is the exact conflation those two
+  /// refusals exist to avoid, arriving late and under a wrong name.
+  ///
+  /// `installed` is deliberately left alone. Clearing it would make the next
+  /// check select and download the same patch again, refuse it again, and loop;
+  /// leaving it means the patch sits on disk being re-read and re-refused once
+  /// per launch, which is cheap and stops the moment a build appears that can
+  /// use it.
+  Future<void> _forgetBootAttempt(int number) async {
+    final current = _state;
+    if (current == null || current.booting != number) return;
+    _state = current.copyWith(clearBooting: true, bootAttempts: 0);
+    try {
+      await _store.writeState(_state!);
+    } on Object catch (error, stackTrace) {
+      _emit(PatchCheckFailed(error, stackTrace));
+    }
+  }
+
+  /// Whether [url] is somewhere a patch for [manifest] is allowed to live.
+  ///
+  /// Same scheme, host and port — and for `file:`, where there is no host and
+  /// no port to compare, the same directory. Without that last clause the check
+  /// was vacuous for a bundled or test manifest: every `file:` URL matched
+  /// every other, so an entry could name any path on the device and pass the
+  /// guard that exists to stop exactly that.
+  static bool _sameOrigin(Uri url, Uri manifest) {
+    if (url.scheme != manifest.scheme) return false;
+    if (url.isScheme('file')) {
+      return p.equals(p.dirname(url.path), p.dirname(manifest.path));
+    }
+    return url.host == manifest.host && url.port == manifest.port;
+  }
+
   /// Returns whether the patch is now installed.
   Future<bool> _download(PatchEntry entry) async {
     final url = config.manifestUrl.resolve(entry.url);
+    // The manifest is signed, so this URL is the key holder's choice — but a
+    // stolen key should only be able to replace patch *content*, and an
+    // arbitrary host turns it into "point every device at a URL of my
+    // choosing", which is a beacon carrying the app id and version whether or
+    // not anything is ever served back. Same origin keeps the blast radius at
+    // the bytes, where the signature check already meets it.
+    if (!_sameOrigin(url, config.manifestUrl)) {
+      _emit(PatchRejectedEvent(
+          entry.number,
+          'patch url $url is not on the same origin as the manifest '
+          '(${config.manifestUrl})'));
+      return false;
+    }
     final response = await _transport.get(url);
     if (!response.isOk) {
       throw PatchTransportException(
@@ -480,7 +575,15 @@ final class MarinefordClient {
     Patch.deactivate();
     _activeNumber = null;
     _state = state.copyWith(installed: 0, clearBooting: true, bootAttempts: 0);
-    await _store.writeState(_state!);
+    try {
+      await _store.writeState(_state!);
+    } on Object catch (error, stackTrace) {
+      // The rollback itself already happened — the patch is deactivated and
+      // the in-memory state says so. Failing to record it means the next
+      // launch tries the patch again, which is recoverable; throwing from a
+      // path reached during startup is not.
+      _emit(PatchCheckFailed(error, stackTrace));
+    }
   }
 
   /// Abandons the current patch and runs the store build.

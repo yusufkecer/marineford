@@ -7,6 +7,9 @@ build/
 plan.md
 # Workspace members do not carry their own lockfile; the root one is committed.
 packages/*/pubspec.lock
+# tool/bridge_dump resolves on its own, outside the workspace, and its lock
+# pins a local override nobody else has.
+tool/*/pubspec.lock
 
 # Generated
 *.g.dart
@@ -35,3 +38,8 @@ Thumbs.db
 # Compiled benchmark
 bench/run
 bench/run.exe
+
+# A working copy of flutter_eval carrying the isAntiAlias fix, so the bridge
+# dump and its round-trip test can run before that fix is published. Local by
+# nature — see the dependency_overrides note in tool/bridge_dump/pubspec.yaml.
+tool/bridge_dump/.flutter_eval_local/

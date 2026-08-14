@@ -25,6 +25,32 @@ final class PatchableService {
 }
 ''';
 
+/// Enough of Flutter's framework to resolve a `Widget` return.
+///
+/// Declared at the URI Flutter itself declares them at, because that is what
+/// the generator matches on. A `Widget` from anywhere else resolves fine and is
+/// then rejected — which is a distinction worth being able to test, and the
+/// reason this is not simply `class Widget {}` in the app package.
+const _flutterStub = r'''
+abstract class Widget {
+  const Widget();
+}
+
+abstract class BuildContext {}
+
+abstract class StatelessWidget extends Widget {
+  const StatelessWidget();
+  Widget build(BuildContext context);
+}
+
+class Text extends StatelessWidget {
+  const Text(this.data);
+  final String data;
+  @override
+  Widget build(BuildContext context) => this;
+}
+''';
+
 /// Parses [source] as Dart, failing the test with the analyzer's own message.
 ///
 /// The old check counted braces, which is why a generated `super.foo()` call
@@ -89,6 +115,7 @@ Future<String> generate(String source) async {
       // annotations by their library URL.
       'marineford|lib/src/annotations.dart': _annotationStub,
       'marineford|lib/marineford.dart': _runtimeStub,
+      'flutter|lib/src/widgets/framework.dart': _flutterStub,
       'app|lib/pricing.dart': source,
     },
     // Without this the builder also runs over the stub packages, and resolving
@@ -519,8 +546,16 @@ class ServiceBase {
 ''');
       expect(
           output, contains('if (_mfGeneration == Patch.generation) return;'));
-      expect(output, contains('int? _mfSlot0;'));
-      expect(output, contains('int? _mfSlot1;'));
+      // Static, spelled out. The dispatch table is global, so an instance
+      // field bought nothing and cost a name lookup per method on the first
+      // call to every new object — a service constructed per request or per
+      // build never warmed the cache, which is exactly the case the caching
+      // exists for. `contains('int? _mfSlot0;')` also matches the static
+      // form, so it has to be asserted with the keyword or it is not asserted.
+      expect(output, contains('static int _mfGeneration = -1;'));
+      expect(output, contains('static int? _mfSlot0;'));
+      expect(output, contains('static int? _mfSlot1;'));
+      expect(output, contains('static void _mfSync() {'));
       expect(output, contains('_mfSync();'));
     });
 
@@ -753,6 +788,97 @@ int _f(int _mfSlot, int _mfResult) => _mfSlot;
       expectValidDart(
           'library x;\n${output.replaceFirst("part of 'pricing.dart';", '')}'
           '\nint _f(int a, int b) => a;');
+    });
+  });
+
+  group('Flutter widgets', () {
+    // `_imports` ends with the part directive, so the Flutter import cannot be
+    // appended to it — an import after a part is a parse error, and the
+    // generator would report that instead of the verdict under test.
+    const flutter = "import 'package:flutter/src/widgets/framework.dart';";
+    const imports = '''
+import 'dart:async';
+import 'package:marineford/marineford.dart';
+$flutter
+part 'pricing.marineford.dart';
+''';
+
+    test('a Widget return is converted like any other value', () async {
+      final output = await generate('''
+$imports
+@patchable
+Widget _row(Map<String, dynamic> data) => Text(data['label']);
+''');
+      // The whole point of the boundary work: no special case reaches the
+      // emitted code. A widget converts through the same helper a String does.
+      expect(collapse(output),
+          contains('MarinefordJson.valueOf<Widget>(_mfResult)'));
+      expectValidDart(asLibrary(output,
+          '$flutter\nWidget _row(Map<String, dynamic> d) => Text("");'));
+    });
+
+    test('a subclass return converts to the subclass', () async {
+      final output = await generate('''
+$imports
+@patchable
+Text _label(String value) => Text(value);
+''');
+      // Narrower than `Widget`, and deliberately so: a patch that hands back
+      // some other widget fails the `is` test and the original runs.
+      expect(collapse(output),
+          contains('MarinefordJson.valueOf<Text>(_mfResult)'));
+    });
+
+    test('a List<Widget> return converts element by element', () async {
+      final output = await generate('''
+$imports
+@patchable
+List<Widget> _children(Map<String, dynamic> data) => [Text('a')];
+''');
+      expect(collapse(output),
+          contains('MarinefordJson.listOf<Widget>(_mfResult)'));
+    });
+
+    test('an async Widget return is allowed', () async {
+      final output = await generate('''
+$imports
+@patchable
+Future<Widget> _later(String value) async => Text(value);
+''');
+      expect(collapse(output), contains('Patch.dispatchAsync'));
+      expect(collapse(output),
+          contains('MarinefordJson.valueOf<Widget>(_mfValue)'));
+    });
+
+    test('a Widget parameter is a build error', () async {
+      final error = await generateError('''
+$imports
+@patchable
+String _describe(Widget child) => '';
+''');
+      expect(error, contains('cannot be handed one'));
+    });
+
+    test('a BuildContext parameter says to move the boundary', () async {
+      final error = await generateError('''
+$imports
+@patchable
+Widget _build(BuildContext context) => Text('');
+''');
+      expect(error, contains('chokepoint'));
+      expect(error, contains('cannot be marked directly'));
+    });
+
+    test('a class called Widget from elsewhere is still rejected', () async {
+      // The match is on the declaring library, not the name. A domain class
+      // that happens to be called `Widget` needs a binding like any other.
+      final error = await generateError('''
+$_imports
+class Widget {}
+@patchable
+Widget _mine(int v) => Widget();
+''');
+      expect(error, contains('needs a dart_eval binding'));
     });
   });
 

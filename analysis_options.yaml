@@ -18,6 +18,12 @@ analyzer:
     - "**/*.g.dart"
     - "**/*.marineford.dart"
     - "**/*.eval.dart"
+    # The only package that depends on flutter_eval, kept out of the workspace
+    # so an upstream break costs a stale generated file rather than a repository
+    # that will not analyse. Excluding it here is the other half of that: `dart
+    # analyze` walks directories, not workspace members, so without this the
+    # isolation would only hold for resolution. It has its own options file.
+    - "tool/**"
 
 linter:
   rules:

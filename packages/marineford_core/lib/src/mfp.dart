@@ -113,8 +113,12 @@ final class MfpContainer {
 
   /// The patch program, still compressed if [MfpFlags.gzip] is set.
   ///
-  /// A copy, not a view onto the original buffer: a view would let a caller
-  /// mutate the bytes the signature was checked over.
+  /// A view onto the buffer `MfpContainer.parse` was given, not a copy. Copying it doubled
+  /// the memory held for unverified bytes to no end: a caller that wanted to
+  /// corrupt what the signature covers could equally corrupt the buffer it
+  /// handed in, so the copy defended against nothing an attacker would bother
+  /// with. Treat these bytes as read-only, and do not hold the container past
+  /// the point the payload has been inflated.
   final Uint8List payload;
 
   /// The Ed25519 signature trailer.
@@ -170,16 +174,32 @@ final class MfpContainer {
           '${bytes.length} bytes');
     }
 
+    // Views, not copies. This runs before the signature has been checked, on
+    // bytes a server chose, and `payload` and `signedRegion` are each nearly
+    // the whole file — copying both meant a download peaked at roughly three
+    // times its own size while still entirely untrusted. Neither is mutated
+    // afterwards: `signedRegion` goes to `verify`, `payload` to the gzip
+    // decoder, and both are read-only from there.
+    //
+    // The signature is a view as well. It was a copy on the argument that 64
+    // bytes should not pin the whole download — which was already false the
+    // moment the other two became views, since a container holding either of
+    // them keeps the same buffer reachable anyway. Copying bought nothing and
+    // made the file read as if it did.
+    //
+    // A container is short-lived by design: parse, verify, inflate, discard.
+    // Anything that wants to outlive the download should keep the inflated
+    // bytecode, not the container.
     return MfpContainer._(
       flags: flags,
       schema: schema,
       abi: AbiFingerprint.fromBytes(Uint8List.sublistView(bytes, 8, 40)),
-      payload: Uint8List.fromList(Uint8List.sublistView(
-          bytes, kMfpHeaderLength, kMfpHeaderLength + payloadLength)),
-      signature: Uint8List.fromList(
-          Uint8List.sublistView(bytes, bytes.length - kMfpSignatureLength)),
-      signedRegion: Uint8List.fromList(
-          Uint8List.sublistView(bytes, 0, bytes.length - kMfpSignatureLength)),
+      payload: Uint8List.sublistView(
+          bytes, kMfpHeaderLength, kMfpHeaderLength + payloadLength),
+      signature:
+          Uint8List.sublistView(bytes, bytes.length - kMfpSignatureLength),
+      signedRegion:
+          Uint8List.sublistView(bytes, 0, bytes.length - kMfpSignatureLength),
     );
   }
 

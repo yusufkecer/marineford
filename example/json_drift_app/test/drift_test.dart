@@ -2,8 +2,11 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:flutter/material.dart';
+import 'package:flutter_eval/flutter_eval.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:json_drift_app/api_client.dart';
+import 'package:json_drift_app/collect_day_screen.dart';
 import 'package:json_drift_app/marineford.g.dart';
 import 'package:marineford/marineford.dart';
 import 'package:marineford_cli/marineford_cli.dart';
@@ -132,6 +135,12 @@ void main() {
                   .readAsStringSync(),
           activation: PatchActivation.immediate,
           autoConfirmBootAfter: null,
+          // What lets a patch build widgets. Without it the widget override
+          // compiles and loads, then fails on the first `Column` it cannot
+          // resolve and falls back to the shipped card — safely, silently, and
+          // uselessly. An app that only patches logic leaves this out and
+          // never links flutter_eval at all.
+          plugins: const [flutterEvalPlugin],
         ),
         store: PatchStore(storage),
         transport: _FileTransport(dist),
@@ -160,8 +169,58 @@ void main() {
     test('parseCollectDay itself was never patched', () {
       // The function with the bug is not in the id registry and never could
       // be. Fixing the chokepoint above it was enough.
-      expect(kMarinefordPatchIds, hasLength(1));
-      expect(kMarinefordPatchIds.single, endsWith('#normalizeResponse'));
+      expect(kMarinefordPatchIds, isNot(contains(contains('parseCollectDay'))));
+    });
+
+    group('and the screen it draws', () {
+      // The same patch, the same activation — one `.mfp` carrying both
+      // overrides, because they are one release. The pairing is the realistic
+      // one: the backend changed, and the card that renders the result was
+      // always slightly wrong about what to do when there is no result.
+      Future<void> pumpCard(WidgetTester tester, String day) =>
+          tester.pumpWidget(MaterialApp(home: CollectDayScreen(day: day)));
+
+      testWidgets('a known day still renders the same', (tester) async {
+        await pumpCard(tester, 'Salı');
+        expect(find.text('Toplama günü'), findsOneWidget);
+        expect(find.text('Salı'), findsOneWidget);
+      });
+
+      testWidgets('a missing day no longer looks like an answer',
+          (tester) async {
+        await pumpCard(tester, 'Belirlenmemiş');
+
+        // What shipped: the placeholder set at 28pt, indistinguishable from a
+        // real day. What the patch does: say plainly that it could not be
+        // read, at a size that does not claim to be an answer.
+        expect(find.text('Belirlenmemiş'), findsNothing);
+        expect(find.text('Toplama günü alınamadı'), findsOneWidget);
+        expect(find.text('Daha sonra tekrar deneyin'), findsOneWidget);
+
+        final style = tester
+            .widget<Text>(
+              find.text('Daha sonra tekrar deneyin'),
+            )
+            .style;
+        expect(style?.fontSize, 16.0,
+            reason: 'the placeholder must not keep the answer size');
+      });
+    });
+  });
+
+  group('before any patch the card is the broken one', () {
+    testWidgets('the placeholder is rendered as if it were a day',
+        (tester) async {
+      // Deliberately asserting the bug. It is what users of 1.4.0 see, and the
+      // patch group above is only meaningful against it.
+      await tester.pumpWidget(
+        const MaterialApp(home: CollectDayScreen(day: 'Belirlenmemiş')),
+      );
+      expect(find.text('Belirlenmemiş'), findsOneWidget);
+      expect(
+        tester.widget<Text>(find.text('Belirlenmemiş')).style?.fontSize,
+        28.0,
+      );
     });
   });
 }

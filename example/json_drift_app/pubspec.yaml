@@ -14,6 +14,10 @@ resolution: workspace
 dependencies:
   flutter:
     sdk: flutter
+  # A real dependency, not a dev one: the app registers flutter_eval's plugin
+  # so a patch can build widgets. Nothing in `marineford` pulls this in — an
+  # app that only patches logic never pays for it.
+  flutter_eval: ^0.8.2
   marineford: ^0.1.0-dev
   pub_semver: ^2.1.5
 

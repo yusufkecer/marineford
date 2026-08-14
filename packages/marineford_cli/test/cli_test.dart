@@ -120,6 +120,44 @@ void main() {
       expect(container.flags.has(MfpFlags.gzip), isTrue);
     });
 
+    test('a patch that builds widgets compiles from pure Dart', () async {
+      // The load-bearing claim of the whole Flutter story: this process has no
+      // Flutter and cannot have it — flutter_eval imports `dart:ui`, which the
+      // standalone VM does not provide — yet it compiles a patch that builds a
+      // widget tree. It works because the compiler only needs the declared
+      // shapes, and those are bundled as data by `tool/bridge_dump`.
+      final project = await initProject();
+      writeIdRegistry();
+      writePatchPackage('''import 'package:flutter/material.dart';
+
+class RuntimeOverride {
+  const RuntimeOverride(this.id, {this.version});
+  final String id;
+  final String? version;
+}
+
+@RuntimeOverride('pkg:app/lib/api.dart#normalize', version: '>=1.0.0 <2.0.0')
+Widget normalize(Map<String, dynamic> data) {
+  return Column(
+    children: [
+      Text(data['label']),
+      Padding(
+        padding: EdgeInsets.all(8.0),
+        child: Text(data['total']),
+      ),
+    ],
+  );
+}
+''');
+
+      final file = await commands.build(project);
+
+      expect(file.existsSync(), isTrue);
+      final container = MfpContainer.parse(file.readAsBytesSync());
+      expect(container.abi, AbiFingerprint.parse(_abi));
+      expect(console.text, contains('pkg:app/lib/api.dart#normalize'));
+    });
+
     test('a patch importing dart:io is refused before it compiles', () async {
       // marineford grants a patch no permissions, so every dart:io call either
       // throws at runtime or is refused by the sandbox. Letting it build means
@@ -525,6 +563,65 @@ int normalize(int v) {
           reason: 'the file stays available for forensics');
     });
 
+    test('a dry run writes nothing and says where devices land', () async {
+      // Revoking has no undo — the revoked list only grows — and its effect is
+      // not obvious: devices do not stop patching, they move to the best patch
+      // still standing. Both are reasons to be able to ask first.
+      final project = await initProject();
+      writeIdRegistry();
+      writePatchPackage(_goodPatch);
+      for (var i = 0; i < 2; i++) {
+        await commands.build(project);
+        await commands.publish(project,
+            target: targetFor('prod'),
+            channel: 'prod',
+            appVersions: VersionConstraint.parse('>=1.0.0 <=1.9.9'));
+      }
+
+      await commands.revoke(project,
+          target: targetFor('prod'),
+          channel: 'prod',
+          numbers: {2},
+          previewFor: Version.parse('1.4.0'));
+
+      final manifest = SignedManifest.parse(
+              File(p.join(root.path, 'dist', 'prod', 'manifest.json'))
+                  .readAsBytesSync())
+          .open();
+      expect(manifest.revoked, isEmpty,
+          reason: 'a dry run must not touch the channel');
+      expect(console.text, contains('nothing is written'));
+      expect(console.text, contains('#1'),
+          reason: 'devices on #2 fall back to #1, and the table has to say so');
+    });
+
+    test('a dry run warns when the fallback is behind a staged rollout',
+        () async {
+      // The trap the table alone would hide: #1 is the destination, but only
+      // for the devices inside its rollout. The rest go further back.
+      final project = await initProject();
+      writeIdRegistry();
+      writePatchPackage(_goodPatch);
+      for (var i = 0; i < 2; i++) {
+        await commands.build(project);
+        await commands.publish(project,
+            target: targetFor('prod'),
+            channel: 'prod',
+            appVersions: VersionConstraint.parse('>=1.0.0 <=1.9.9'));
+      }
+      await commands.rollout(project,
+          target: targetFor('prod'), channel: 'prod', number: 1, fraction: 0.4);
+
+      await commands.revoke(project,
+          target: targetFor('prod'),
+          channel: 'prod',
+          numbers: {2},
+          previewFor: Version.parse('1.4.0'));
+
+      expect(console.text, contains('40% rollout'));
+      expect(console.text, contains('marineford rollout 1 --percent 100'));
+    });
+
     test('a revoked number is not reused', () async {
       final project = await initProject();
       writeIdRegistry();
@@ -615,6 +712,43 @@ int normalize(int v) {
         throwsA(isA<CliException>()
             .having((e) => e.message, 'message', contains('app_id'))),
       );
+    });
+  });
+
+  group('an unreadable signing key', () {
+    // The signing key is the whole security model, so the one path where the
+    // answer is never "try again" should not arrive as a bare FormatException
+    // and a stack trace. A CI secret that picked up a newline, or the public
+    // key pasted where the seed belonged, both land here.
+    Future<void> expectRefusal(String contents, Matcher message) async {
+      final project = await initProject();
+      writeIdRegistry();
+      writePatchPackage(_goodPatch);
+      await commands.build(project);
+      project.privateKeyFile.writeAsStringSync(contents);
+
+      await expectLater(
+        commands.publish(
+          project,
+          target: targetFor('prod'),
+          channel: 'prod',
+          appVersions: VersionConstraint.parse('>=1.0.0 <2.0.0'),
+        ),
+        throwsA(isA<CliException>()
+            .having((e) => e.message, 'message', message)
+            .having((e) => e.hint, 'hint', contains('base64 seed'))),
+      );
+    }
+
+    test('is refused with the path when it is not base64', () async {
+      await expectRefusal('not base64 at all!!', contains('not base64'));
+    });
+
+    test('is refused when it is base64 of the wrong length', () async {
+      // Valid base64, useless as a seed — what pasting the public key looks
+      // like, since that is base64 too.
+      await expectRefusal(
+          base64Encode(List<int>.filled(7, 1)), contains('Ed25519 seed'));
     });
   });
 }

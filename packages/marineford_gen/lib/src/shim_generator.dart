@@ -301,7 +301,7 @@ ${_body(id, signature, '$privateName(${signature.forwarding})', slotExpression: 
         origin: '$libraryId $generatedName.$name()',
       ));
 
-      fields.writeln('  int? _mfSlot$i;');
+      fields.writeln('  static int? _mfSlot$i;');
       sync.writeln("    _mfSlot$i = Patch.slot(r'$id');");
       overrides.writeln('''
   @override
@@ -318,15 +318,23 @@ ${_body(id, signature, 'super.$name(${signature.forwarding})', slotExpression: '
 /// Use this class at your call sites. Each method dispatches to a patch when
 /// one is live and to `$baseName` otherwise.
 class $generatedName extends $baseName {
-${_constructors(element, generatedName, baseName)}  int _mfGeneration = -1;
+${_constructors(element, generatedName, baseName)}  static int _mfGeneration = -1;
 ${fields.toString().trimRight()}
 
   /// Refreshes the cached slots when a patch is activated or removed.
   ///
   /// Comparing an int is cheaper than a map lookup, and this runs on every
   /// call, so the cheap version is the one that matters.
+  ///
+  /// Static, and that is the whole point of the cache. The dispatch table and
+  /// the generation counter are global, so nothing here is per-instance — but
+  /// while these were instance fields, every new object started at generation
+  /// -1 and paid a name lookup per method on its first call. A service built
+  /// once per request, or per widget build, never warmed the cache at all and
+  /// the caching was pure overhead. Static makes the cost what the benchmark
+  /// always claimed it was: one integer compare.
   @pragma('vm:prefer-inline')
-  void _mfSync() {
+  static void _mfSync() {
     if (_mfGeneration == Patch.generation) return;
     _mfGeneration = Patch.generation;
 ${sync.toString().trimRight()}

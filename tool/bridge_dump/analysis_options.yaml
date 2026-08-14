@@ -1,0 +1,26 @@
+# Its own, because the root options file excludes `tool/**`. See the note there:
+# this package depends on flutter_eval and is deliberately isolated from the
+# repository's analysis so an upstream break cannot stop the rest building.
+include: package:lints/recommended.yaml
+
+analyzer:
+  language:
+    strict-casts: true
+    strict-inference: true
+    strict-raw-types: true
+  # Copied from the root, not softened. The exclusion up there exists to keep
+  # flutter_eval's resolution away from the rest of the repository, not to let
+  # this package off the rules — and this is where the sandbox and round-trip
+  # tests live, so a swallowed exception here turns a failing denial into a
+  # passing test with nothing to notice it.
+  errors:
+    empty_catches: error
+    unawaited_futures: error
+
+linter:
+  rules:
+    - always_declare_return_types
+    - directives_ordering
+    - prefer_final_locals
+    - prefer_single_quotes
+    - sort_pub_dependencies

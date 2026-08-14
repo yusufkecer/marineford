@@ -204,16 +204,32 @@ final class PatchManifest {
 
   /// Monotonically increasing publication counter.
   ///
-  /// The defence against a stale manifest. Every signature stays valid forever,
-  /// so without this an attacker who controls the CDN can keep serving the last
-  /// manifest published *before* a revocation and the kill switch never
-  /// reaches anyone. A client remembers the highest sequence it has accepted
-  /// and refuses anything lower.
+  /// Every signature stays valid forever, so a client that accepted whatever it
+  /// was handed could be walked backwards: serve the manifest from before a
+  /// revocation and the kill switch is undone. A client remembers the highest
+  /// sequence it has accepted and refuses anything lower, which closes that.
+  ///
+  /// Be precise about what it does not close. This stops knowledge being taken
+  /// *back*; it does not force knowledge *forward*. A device that has not yet
+  /// seen the manifest carrying a revocation has a low remembered sequence, so
+  /// serving it that same older manifest forever passes this check every time —
+  /// equal and higher are both accepted, as they must be, since an unchanged
+  /// manifest is what every ordinary check returns.
+  ///
+  /// So `revoke` reaches a device only if the device can reach a current
+  /// manifest. Two things make that true in practice and neither is this
+  /// counter: `manifestUrl` is required to be https, so nobody on the path can
+  /// answer for your host; and beyond that you are trusting whoever serves your
+  /// files, exactly as you trust them not to serve a patch you never signed —
+  /// except they cannot forge that one.
   final int sequence;
 
-  /// When the publisher generated this manifest. Informational only —
-  /// [sequence] is what the client enforces, because a clock is not something
-  /// a device can trust about a file it downloaded.
+  /// When the publisher generated this manifest.
+  ///
+  /// Informational: nothing enforces it. A device's clock is not trustworthy
+  /// enough to reject on, and a publisher who has not shipped in months is the
+  /// normal case rather than an attack, so a max-age rule would fire far more
+  /// often for the boring reason than the interesting one.
   final DateTime generatedAt;
 
   /// Available patches. Not guaranteed to be sorted.

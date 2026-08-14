@@ -498,6 +498,15 @@ List rows(int seed) { return [{'id': 1}, {'id': 2}]; }
 
 @RuntimeOverride('#grouped', version: '>=1.0.0')
 Map grouped(int seed) { return {'a': [1, 2], 'b': [3]}; }
+
+@RuntimeOverride('#rate', version: '>=1.0.0')
+double rate(Map cfg) { return cfg['rate']; }
+
+@RuntimeOverride('#rates', version: '>=1.0.0')
+List rates(Map cfg) { return cfg['rates']; }
+
+@RuntimeOverride('#tally', version: '>=1.0.0')
+Map tally(Map cfg) { return cfg['tally']; }
 ''')..loadGlobalOverrides();
       Patch.activate(runtime, resolveSlots(runtime, Version.parse('1.4.0')));
     });
@@ -563,6 +572,57 @@ Map grouped(int seed) { return {'a': [1, 2], 'b': [3]}; }
       expect(MarinefordJson.listOf<Map<String, int>>(call('#rows', 0)), isNull,
           reason: 'Map<String, int> is not a shape the unwrapping produces, so '
               'the conversion must refuse rather than pretend');
+    });
+
+    group('a double signature handed whole numbers', () {
+      // JSON has one number type. `jsonDecode('{"rate":0}')` gives an `int`,
+      // and `0 is double` is false — so a patch declared to return `double`
+      // used to be rejected by its own shim whenever the value happened to be
+      // whole. Every call, no error, straight back to the original function.
+      Object? rateFor(Object? value) =>
+          call('#rate', MarinefordJson.wrap(<String, Object?>{'rate': value}));
+
+      test('a whole number is widened', () {
+        expect(MarinefordJson.valueOf<double>(rateFor(0)), 0.0);
+        expect(MarinefordJson.valueOf<double>(rateFor(7)), 7.0);
+      });
+
+      test('a real double still works', () {
+        expect(MarinefordJson.valueOf<double>(rateFor(0.5)), 0.5);
+      });
+
+      test('a double is not narrowed to an int', () {
+        // The other direction stays a mismatch. There is no rounding the
+        // caller agreed to, so the original runs instead of guessing.
+        expect(MarinefordJson.valueOf<int>(rateFor(2.5)), isNull);
+      });
+
+      test('an int signature handed an int is untouched', () {
+        expect(MarinefordJson.valueOf<int>(rateFor(2)), 2);
+      });
+
+      test('one whole element no longer discards the whole list', () {
+        final mixed = call(
+            '#rates',
+            MarinefordJson.wrap(<String, Object?>{
+              'rates': <Object?>[1.5, 2],
+            }));
+        expect(MarinefordJson.listOf<double>(mixed), <double>[1.5, 2.0]);
+      });
+
+      test('a map of doubles widens its values', () {
+        final tally = call(
+            '#tally',
+            MarinefordJson.wrap(<String, Object?>{
+              'tally': <String, Object?>{'a': 1, 'b': 2.5},
+            }));
+        expect(MarinefordJson.mapOf<String, double>(tally),
+            <String, double>{'a': 1.0, 'b': 2.5});
+      });
+
+      test('something that is not a number is still refused', () {
+        expect(MarinefordJson.valueOf<double>(rateFor('nope')), isNull);
+      });
     });
   });
 }

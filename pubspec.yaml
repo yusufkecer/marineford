@@ -18,3 +18,24 @@ workspace:
 dev_dependencies:
   lints: ^6.0.0
   test: ^1.25.0
+
+# flutter_eval 0.8.2 does not compile against current Flutter: `$Container`
+# implements `Container` without its `isAntiAlias` field, which makes the class
+# abstract by omission and takes the whole package down. The fork carries that
+# one fix and nothing else.
+#
+# Here rather than in the packages that use it, because a published package
+# cannot carry a git dependency — the members declare an ordinary hosted
+# constraint and this redirects it for anyone working in the repository.
+# Delete it, and this comment, once the fix is released.
+#
+# Upstream PR: https://github.com/ethanblake4/flutter_eval/pull/142
+dependency_overrides:
+  flutter_eval:
+    git:
+      url: https://github.com/yusufkecer/flutter_eval.git
+      # Pinned to a commit, not the branch. A branch is a moving target and the
+      # obvious cleanup after an upstream merge is to delete it — at which
+      # point `flutter pub get` fails for the whole workspace, including every
+      # package that never wanted flutter_eval.
+      ref: 832c478efa6085584d90c3e7c5df86b601cb13c9

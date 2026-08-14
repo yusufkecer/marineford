@@ -113,6 +113,7 @@ class RuntimeOverride {
     double rollout = 1.0,
     Map<int, AbiFingerprint> abiPerPatch = const <int, AbiFingerprint>{},
     int? sequence,
+    String Function(int number)? urlFor,
   }) async {
     _sequence = sequence ?? _sequence + 1;
     final entries = <Map<String, Object?>>[];
@@ -120,7 +121,7 @@ class RuntimeOverride {
       _files['/prod/$number.mfp'] = bytes;
       entries.add(<String, Object?>{
         'number': number,
-        'url': '$number.mfp',
+        'url': urlFor?.call(number) ?? '$number.mfp',
         'size': bytes.length,
         'sha256': sha256Hex(bytes),
         'abi': (abiPerPatch[number] ?? abi).toString(),

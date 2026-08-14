@@ -1,0 +1,60 @@
+name: marineford_bridge_dump
+description: >-
+  Regenerates the Flutter bridge declarations that marineford_cli compiles
+  patches against, and runs the one test that needs both halves at once.
+publish_to: none
+version: 0.0.0
+
+# Deliberately outside the workspace in the root pubspec. This is the only
+# package in the repository that depends on flutter_eval, and flutter_eval
+# tracks Flutter closely enough to break on a stable release — as of writing it
+# does not compile against current Flutter at all. Keeping it out means a broken
+# upstream costs a stale bridge file and a skipped integration test, rather than
+# a repository that will not analyse.
+#
+# The price of being outside the workspace is that the marineford packages have
+# to be named by path here, including the ones only reached transitively: inside
+# a workspace they depend on each other with `any` and let the workspace resolve
+# it, which does not work from outside.
+environment:
+  sdk: ^3.6.0
+
+dependencies:
+  dart_eval: ^0.8.5
+  flutter:
+    sdk: flutter
+  flutter_eval: ^0.8.2
+  marineford: any
+  marineford_cli: any
+  marineford_core: any
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  lints: ^6.0.0
+
+dependency_overrides:
+  # Paths rather than versions, because none of these are published yet and the
+  # constraints they carry for each other are the published ones.
+  #
+  # flutter_eval 0.8.2 does not compile against current Flutter — `$Container`
+  # is missing `isAntiAlias`, which makes the class abstract by omission and
+  # takes the whole package down with it. The fork carries that one fix and
+  # nothing else.
+  #
+  # Upstream PR: https://github.com/ethanblake4/flutter_eval/pull/142
+  # Drop this override and move the constraint above once it is released.
+  flutter_eval:
+    git:
+      url: https://github.com/yusufkecer/flutter_eval.git
+      # Pinned to a commit, not the branch. A branch is a moving target and the
+      # obvious cleanup after an upstream merge is to delete it — at which
+      # point `flutter pub get` fails for the whole workspace, including every
+      # package that never wanted flutter_eval.
+      ref: 832c478efa6085584d90c3e7c5df86b601cb13c9
+  marineford:
+    path: ../../packages/marineford
+  marineford_cli:
+    path: ../../packages/marineford_cli
+  marineford_core:
+    path: ../../packages/marineford_core

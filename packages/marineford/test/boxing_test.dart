@@ -1,4 +1,5 @@
 import 'package:dart_eval/dart_eval.dart';
+import 'package:dart_eval/stdlib/core.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:marineford/marineford.dart';
 import 'package:pub_semver/pub_semver.dart';
@@ -242,6 +243,192 @@ class RuntimeOverride {
       final result = MarinefordJson.unwrapMap(
           MarinefordJson.wrap(<String, dynamic>{'opaque': sentinel}));
       expect(identical(result!['opaque'], sentinel), isTrue);
+    });
+  });
+
+  group('containers cross without being copied', () {
+    // The wrapping used to walk the whole payload before the patch read
+    // anything — 31µs for a fifty-row response against 2.6µs for the crossing
+    // itself, nearly all of it thrown away, because a normaliser reads a
+    // handful of keys. These views wrap what is asked for and nothing else.
+    //
+    // The behaviour that has to be nailed down is what laziness makes newly
+    // possible: the interpreter now holds a reference to the caller's own
+    // structure, so writing through it must not reach the app's data.
+
+    test('a read does not touch the caller structure', () {
+      final source = <String, dynamic>{'a': 1, 'b': 2};
+      final wrapped = MarinefordJson.wrap(source) as $Map;
+      expect(wrapped.$value[$String('a')], isA<$int>());
+      expect(source, <String, dynamic>{'a': 1, 'b': 2});
+    });
+
+    test('the same key twice answers with the same instance', () {
+      // Not cosmetic: interpreted code comparing two reads of one field with
+      // `identical` would otherwise see two different wrappers.
+      final wrapped = MarinefordJson.wrap(<String, dynamic>{'a': 1}) as $Map;
+      final first = wrapped.$value[$String('a')];
+      expect(identical(wrapped.$value[$String('a')], first), isTrue);
+    });
+
+    test('a write copies instead of reaching the app map', () {
+      final source = <String, dynamic>{'a': 1};
+      final wrapped = MarinefordJson.wrap(source) as $Map;
+      wrapped.$value[$String('b')] = $int(9);
+
+      expect(source, <String, dynamic>{'a': 1},
+          reason: 'a patch must not be able to mutate what it was handed');
+      expect(wrapped.$value[$String('b')], isA<$int>());
+      expect(wrapped.$value[$String('a')], isA<$int>(),
+          reason: 'the copy has to carry the entries that were already there');
+    });
+
+    test('a list write copies too', () {
+      final source = <dynamic>[1, 2, 3];
+      final wrapped = MarinefordJson.wrap(source) as $List;
+      wrapped.$value[0] = $int(99);
+
+      expect(source, <dynamic>[1, 2, 3]);
+      expect((wrapped.$value[0] as $int).$value, 99);
+      expect((wrapped.$value[2] as $int).$value, 3);
+    });
+
+    test('removing and clearing also copy', () {
+      final source = <String, dynamic>{'a': 1, 'b': 2};
+      final removed = MarinefordJson.wrap(source) as $Map;
+      removed.$value.remove($String('a'));
+      expect(source.containsKey('a'), isTrue);
+
+      final cleared = MarinefordJson.wrap(source) as $Map;
+      cleared.$value.clear();
+      expect(source, <String, dynamic>{'a': 1, 'b': 2});
+      expect(cleared.$value, isEmpty);
+    });
+
+    test('the map interface answers from the plain source', () {
+      final wrapped =
+          MarinefordJson.wrap(<String, dynamic>{'a': 1, 'b': null}) as $Map;
+      final view = wrapped.$value;
+
+      expect(view.length, 2);
+      expect(view.isEmpty, isFalse);
+      expect(view.isNotEmpty, isTrue);
+      expect(view.containsKey($String('a')), isTrue);
+      expect(view.containsKey($String('zz')), isFalse);
+      expect(view.keys.map((k) => (k as $String).$value), <String>['a', 'b']);
+      expect(view[$String('b')], isA<$null>(),
+          reason: 'a present null must not read as a missing key');
+    });
+
+    test('nesting stays lazy all the way down', () {
+      final inner = <String, dynamic>{'deep': 1};
+      final wrapped =
+          MarinefordJson.wrap(<String, dynamic>{'outer': inner}) as $Map;
+      final nested = wrapped.$value[$String('outer')] as $Map;
+
+      nested.$value[$String('added')] = $int(1);
+      expect(inner, <String, dynamic>{'deep': 1},
+          reason: 'copy-on-write has to hold at every level, not just the top');
+    });
+
+    test('a map handed straight back comes out as itself', () {
+      // The normaliser that inspects a response and returns most of it. Walking
+      // it on the way out would wrap and unwrap every entry to arrive at the
+      // object we started with.
+      final source = <String, dynamic>{
+        'a': 1,
+        'b': <String, dynamic>{'c': 2}
+      };
+      final round = MarinefordJson.unwrap(MarinefordJson.wrap(source));
+      expect(identical(round, source), isTrue);
+    });
+
+    test('a map that was written to is rebuilt, not aliased', () {
+      final source = <String, dynamic>{'a': 1};
+      final wrapped = MarinefordJson.wrap(source) as $Map;
+      wrapped.$value[$String('b')] = $int(2);
+
+      final round = MarinefordJson.unwrap(wrapped);
+      expect(identical(round, source), isFalse);
+      expect(round, <String, dynamic>{'a': 1, 'b': 2});
+    });
+  });
+
+  group('a null in the payload is a value, not a failure', () {
+    // The conversion helpers answer "this does not fit" with a sentinel rather
+    // than with null, and the distinction is the whole test. `V` is `dynamic`
+    // for the two commonest patched return types, `null is dynamic` is true,
+    // and a null-as-failure signal therefore threw away any structure holding
+    // a JSON null — which is most responses, on every call, silently.
+    test('a null element keeps its place in a dynamic list', () {
+      final wrapped = MarinefordJson.wrap(<dynamic>[1, null, 3]);
+      expect(MarinefordJson.listOf<dynamic>(wrapped), <dynamic>[1, null, 3]);
+    });
+
+    test('a null value keeps its key in a dynamic map', () {
+      final wrapped =
+          MarinefordJson.wrap(<String, dynamic>{'a': 1, 'note': null});
+      expect(MarinefordJson.mapOf<String, dynamic>(wrapped),
+          <String, dynamic>{'a': 1, 'note': null});
+    });
+
+    test('a null is still refused where it genuinely does not fit', () {
+      final wrapped = MarinefordJson.wrap(<dynamic>['a', null]);
+      expect(MarinefordJson.listOf<String>(wrapped), isNull);
+      expect(MarinefordJson.valueOf<String>(MarinefordJson.wrap(null)), isNull);
+    });
+
+    test('whole numbers still widen to double, and doubles do not narrow', () {
+      expect(MarinefordJson.valueOf<double>(MarinefordJson.wrap(0)), 0.0);
+      expect(
+          MarinefordJson.listOf<double>(MarinefordJson.wrap(<dynamic>[1.5, 2])),
+          <double>[1.5, 2.0]);
+      expect(MarinefordJson.valueOf<int>(MarinefordJson.wrap(2.5)), isNull);
+    });
+  });
+
+  group('the return path does not re-wrap what it was given', () {
+    // `unwrap` short-circuits an untouched view, but a generated shim for a
+    // `Map` return calls `mapOf`, which reaches the boundary through `_mapView`
+    // — so the short-circuit had to be there too. Without it the flagship
+    // signature wrapped every key and value on the way out and unwrapped each
+    // one straight back, with the plain entries sitting right there.
+    test('a nested container comes back as the same instance', () {
+      final rows = <dynamic>[
+        <String, dynamic>{'i': 1}
+      ];
+      final source = <String, dynamic>{'a': 1, 'rows': rows};
+
+      final converted =
+          MarinefordJson.mapOf<String, dynamic>(MarinefordJson.wrap(source))!;
+      expect(identical(converted['rows'], rows), isTrue,
+          reason: 'a re-wrapped list would be a different object');
+    });
+
+    test('a list element comes back as the same instance', () {
+      final rows = <dynamic>[
+        <String, dynamic>{'i': 1}
+      ];
+      final converted =
+          MarinefordJson.listOf<dynamic>(MarinefordJson.wrap(rows))!;
+      expect(identical(converted.first, rows.first), isTrue);
+    });
+
+    test('keys stay live and keep their identity', () {
+      // Memoising the key *list* fixed the re-wrapping and broke this: the
+      // snapshot disagreed with `length` and `containsKey`, which still read
+      // the caller's map, and being `late final` it never recovered.
+      final live = <String, dynamic>{'a': 1};
+      final view = (MarinefordJson.wrap(live) as $Map).$value;
+
+      final first = view.keys.first;
+      live['b'] = 2;
+
+      expect(view.keys.length, view.length,
+          reason: 'the view must not contradict itself');
+      expect(view.keys.length, 2);
+      expect(identical(view.keys.first, first), isTrue,
+          reason: 'and a key seen twice is still the same wrapper');
     });
   });
 }

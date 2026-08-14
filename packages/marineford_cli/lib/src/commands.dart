@@ -28,6 +28,19 @@ final class StdoutConsole implements Console {
   void write(String line) => stdout.writeln(line);
 }
 
+/// A [Console] that prints to stderr.
+///
+/// Separate from [StdoutConsole] so the runner can be handed both and a test
+/// can tell which stream a message went to — the difference matters to anyone
+/// piping this in a script.
+final class StderrConsole implements Console {
+  /// Creates a [StderrConsole].
+  const StderrConsole();
+
+  @override
+  void write(String line) => stderr.writeln(line);
+}
+
 /// A [Console] that records, for tests.
 final class RecordingConsole implements Console {
   /// Every line written, in order.
@@ -274,14 +287,22 @@ size_budget_kb: 256
     required PublishTarget target,
     required String channel,
     required Set<int> numbers,
+    Version? previewFor,
   }) async {
-    final signer = await _loadSigner(project);
     final publisher = ChannelPublisher(
       target: target,
       project: project,
       channel: channel,
     );
     final manifest = await publisher.read();
+
+    if (previewFor != null) {
+      _previewRevoke(
+          project, manifest, publisher, channel, numbers, previewFor);
+      return;
+    }
+
+    final signer = await _loadSigner(project);
     await publisher.write(publisher.withRevoked(manifest, numbers), signer);
 
     console
@@ -289,6 +310,107 @@ size_budget_kb: 256
       ..write('Devices roll back on their next check. Nothing is deleted, so '
           'the files stay')
       ..write('available for forensics.');
+  }
+
+  /// Shows where each device would end up if [numbers] were revoked.
+  ///
+  /// Revoking is the one command with no way back — the revoked list only ever
+  /// grows, so a number retired by mistake is retired for good and the fix is a
+  /// fresh publish. It is also the command whose effect is least obvious:
+  /// devices do not simply stop patching, they move to the best patch still
+  /// standing, which may be an older one, or the store build, or nothing at
+  /// all. This runs the real [selectPatch] against a hypothetical manifest and
+  /// prints the answer before anything is written.
+  ///
+  /// Rollout is normalised to 100% for the simulation. Leaving it in would make
+  /// every row true only for the one synthetic device this asks about; the
+  /// fractions that actually change the answer are called out underneath
+  /// instead.
+  ///
+  /// The simulated device has an empty blocklist, which is the other place this
+  /// is optimistic and the reason the header says so. A device that crash-looped
+  /// on the patch it would otherwise fall back to goes further back still, and
+  /// nothing here can know which devices those are — the blocklist is local and
+  /// never reported.
+  void _previewRevoke(
+    MarinefordProject project,
+    PatchManifest manifest,
+    ChannelPublisher publisher,
+    String channel,
+    Set<int> numbers,
+    Version appVersion,
+  ) {
+    final registry = _requireRegistry(project);
+    final revoked = publisher.withRevoked(manifest, numbers);
+    final everyoneInRollout = PatchManifest(
+      schema: revoked.schema,
+      appId: revoked.appId,
+      channel: revoked.channel,
+      sequence: revoked.sequence,
+      generatedAt: revoked.generatedAt,
+      patches: <PatchEntry>[
+        for (final entry in revoked.patches) entry.copyWith(rollout: 1),
+      ],
+      revoked: revoked.revoked,
+    );
+
+    String outcome(int installed) {
+      final decision = selectPatch(
+        everyoneInRollout,
+        SelectionContext(
+          appId: project.appId,
+          channel: channel,
+          abi: AbiFingerprint.parse(registry.abi),
+          appVersion: appVersion,
+          installId: 'preview',
+          installedPatch: installed,
+        ),
+      );
+      return switch (decision) {
+        ApplyPatch(entry: final entry) => '#${entry.number}',
+        RollBackToBase() => 'the store build',
+        // Not reachable from a manifest this command just built — it carries
+        // the project's own app id and channel — but a hole here would be a
+        // silent wrong answer rather than a compile error, so it is spelled out.
+        ManifestRejected(reason: final reason) => 'nothing ($reason)',
+        StayOnCurrent() =>
+          installed == 0 ? 'nothing' : 'unchanged (#$installed)',
+      };
+    }
+
+    final states = <int>[
+      0,
+      for (final entry in manifest.patches) entry.number,
+    ]..sort();
+
+    console
+      ..write('Revoking ${numbers.map((n) => '#$n').join(', ')} on $channel — '
+          'dry run, nothing is written.')
+      ..write('Simulated for app $appVersion, with every device inside the '
+          'rollout and nothing locally blocklisted.')
+      ..write('')
+      ..write('  device on     becomes')
+      ..write('  ---------     -------');
+    for (final installed in states) {
+      final label = installed == 0 ? 'nothing' : '#$installed';
+      console.write('  ${label.padRight(13)} ${outcome(installed)}');
+    }
+
+    final staged = <PatchEntry>[
+      for (final entry in revoked.patches)
+        if (entry.rollout < 1.0 && !revoked.revoked.contains(entry.number))
+          entry,
+    ];
+    if (staged.isNotEmpty) {
+      console.write('');
+      for (final entry in staged) {
+        console.write('  #${entry.number} is at '
+            '${(entry.rollout * 100).toStringAsFixed(0)}% rollout, so the rest '
+            'fall back further than the table shows.');
+      }
+      console.write('  Raise it first if that is not what you want: '
+          'marineford rollout ${staged.first.number} --percent 100');
+    }
   }
 
   /// Changes a patch's staged rollout fraction.
@@ -449,8 +571,13 @@ size_budget_kb: 256
   Future<PatchSigner> _loadSigner(MarinefordProject project) async {
     final fromEnvironment = Platform.environment['MARINEFORD_SIGNING_KEY'];
     if (fromEnvironment != null && fromEnvironment.isNotEmpty) {
-      return PatchSigner.fromSeed(
-          Uint8List.fromList(base64Decode(fromEnvironment.trim())));
+      return _signerFromSeed(
+        fromEnvironment,
+        'MARINEFORD_SIGNING_KEY',
+        'The variable should hold the base64 seed `marineford init` printed, '
+            'with nothing around it. A CI secret that picked up a newline or '
+            'was stored as the public key looks exactly like this.',
+      );
     }
     final file = project.privateKeyFile;
     if (!file.existsSync()) {
@@ -461,8 +588,51 @@ size_budget_kb: 256
             'seed — that is the form to use in CI.',
       );
     }
-    return PatchSigner.fromSeed(
-        Uint8List.fromList(base64Decode((await file.readAsString()).trim())));
+    return _signerFromSeed(
+      await file.readAsString(),
+      file.path,
+      'The file should hold nothing but the base64 seed `marineford init` '
+      'wrote. Restore it from your backup — a key that cannot be read is a '
+      'key you cannot publish with again.',
+    );
+  }
+
+  /// Builds a signer from a base64 [seed], naming [source] when it will not.
+  ///
+  /// A malformed key reached the user as a bare `FormatException` and a stack
+  /// trace, which is a poor way to learn that a CI secret has a stray newline
+  /// in it. It is also the one path where the answer is never "try again": the
+  /// signing key is the whole security model, so the message says which of the
+  /// two places it came from and what a good one looks like.
+  Future<PatchSigner> _signerFromSeed(
+      String seed, String source, String hint) async {
+    final Uint8List bytes;
+    try {
+      bytes = Uint8List.fromList(base64Decode(seed.trim()));
+    } on FormatException catch (e) {
+      throw CliException(
+          'the signing key in $source is not base64 '
+          '(${e.message})',
+          hint: hint);
+    }
+    try {
+      return await PatchSigner.fromSeed(bytes);
+    } on FormatException catch (e) {
+      // Well-formed base64 of the wrong length, most often: a public key
+      // pasted where the seed belonged. Named rather than caught as `Object`,
+      // so a future `fromSeed` that reports something else — a revoked key, a
+      // key of the wrong kind — reaches the user as itself instead of being
+      // relabelled "not a usable seed" and sending them after the wrong thing.
+      throw CliException(
+        'the signing key in $source is not a usable Ed25519 seed (${e.message})',
+        hint: hint,
+      );
+    } on ArgumentError catch (e) {
+      throw CliException(
+        'the signing key in $source was refused by Ed25519 (${e.message})',
+        hint: hint,
+      );
+    }
   }
 
   static String _kb(int bytes) => '${(bytes / 1024).toStringAsFixed(1)} KB';

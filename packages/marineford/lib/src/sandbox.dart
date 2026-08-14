@@ -51,9 +51,19 @@ final class MarinefordSandbox implements EvalPlugin {
   /// Creates a [MarinefordSandbox].
   const MarinefordSandbox();
 
+  /// The dart_eval release [deniedIoBridges] was read off.
+  ///
+  /// That list is a hand audit, and the dependency constraint is a caret range
+  /// — so a patch release could add an ungated binding without a line changing
+  /// here, and the sandbox would quietly stop covering what it claims to.
+  /// `sandbox_test.dart` compares this against the resolved version and fails
+  /// when they drift, which turns a silent hole into a chore.
+  static const String auditedDartEvalVersion = '0.8.5';
+
   /// Bridge functions dart_eval registers for `dart:io` without a permission
-  /// check, as of 0.8.5. Everything else in `dart:io` is gated already and
-  /// denied by default because marineford grants no permissions.
+  /// check, as of [auditedDartEvalVersion]. Everything else in `dart:io` is
+  /// gated already and denied by default because marineford grants no
+  /// permissions.
   static const List<String> deniedIoBridges = <String>[
     'InternetAddress.',
     'InternetAddress.fromRawAddress',

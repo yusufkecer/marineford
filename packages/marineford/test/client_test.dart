@@ -286,6 +286,58 @@ void main() {
     });
   });
 
+  group('what the transport is allowed to hand back', () {
+    test('a plaintext manifest url is refused at construction', () {
+      // A signature says who wrote a manifest, not that it is the current one.
+      // Over http anyone on the path can answer 304 forever, which turns
+      // `revoke` into a suggestion — so this is refused where it is cheapest
+      // to notice, rather than at the first check.
+      expect(
+        () => MarinefordConfig(
+          appId: 'com.example.app',
+          appVersion: Version.parse('1.4.0'),
+          abi: cdn.abi.toString(),
+          manifestUrl: Uri.parse('http://cdn.example.com/manifest.json'),
+          publicKey: cdn.publicKey,
+        ),
+        throwsA(isA<FormatException>()),
+      );
+    });
+
+    test('plaintext is allowed when it is asked for explicitly', () {
+      expect(
+        MarinefordConfig(
+          appId: 'com.example.app',
+          appVersion: Version.parse('1.4.0'),
+          abi: cdn.abi.toString(),
+          manifestUrl: Uri.parse('http://localhost:8080/manifest.json'),
+          publicKey: cdn.publicKey,
+          allowInsecureManifestUrl: true,
+        ).manifestUrl.scheme,
+        'http',
+      );
+    });
+
+    test('a patch url on another origin is refused', () async {
+      // The manifest is signed, so this is the key holder's choice — but a
+      // stolen key should be able to swap patch bytes, not aim every device at
+      // a host of the attacker's choosing.
+      final good = await cdn.buildPatch(_patchSource);
+      await cdn.publish({7: good}, urlFor: (n) => 'https://evil.test/$n.mfp');
+
+      final client = makeClient();
+      await client.start();
+      await client.checkForUpdate();
+
+      expect(total(2, 3), 5, reason: 'the patch must not have been installed');
+      expect(
+        observer.events.whereType<PatchRejectedEvent>().map((e) => e.reason),
+        contains(contains('not on the same origin')),
+      );
+      client.dispose();
+    });
+  });
+
   group('refusing bad patches', () {
     test('a tampered container is refused and blocklisted', () async {
       final good = await cdn.buildPatch(_patchSource);
@@ -372,8 +424,13 @@ void main() {
           lastSequence: 1);
     });
 
-    test('a v2 patch needing the Flutter bridge is refused, not crashed on',
+    test('a v2 patch needing the Flutter bridge is refused, not condemned',
         () async {
+      // The forward-compatibility hatch. Refusing is the point; blocklisting
+      // is not, because the blocklist is permanent and nothing clears it — so
+      // condemning a patch for using a flag this build does not know yet means
+      // the same patch is still refused after a store update to the build that
+      // does. That turns the escape hatch into a trap.
       final patch =
           await cdn.buildPatch(_patchSource, flags: const MfpFlags(1 | 1 << 1));
       await cdn.publish({7: patch});
@@ -383,8 +440,52 @@ void main() {
       await client.checkForUpdate();
 
       expect(client.activePatch, 0);
-      expect(observer.ofType<PatchBlocklisted>().single.reason,
+      expect(observer.ofType<PatchRejectedEvent>().last.reason,
           contains('newer marineford'));
+      expect(observer.ofType<PatchBlocklisted>(), isEmpty,
+          reason: 'a flag this build does not support is a fact about the '
+              'build, not about the patch');
+      expect(client.state.blocklist, isNot(contains(7)));
+      client.dispose();
+    });
+
+    test('a patch refused for its flags installs after the build catches up',
+        () async {
+      // The consequence, spelled out: the same patch number, the same manifest,
+      // a build that now understands the flag. Nothing on the device may be
+      // left over that stops it.
+      final patch =
+          await cdn.buildPatch(_patchSource, flags: const MfpFlags(1 | 1 << 1));
+      await cdn.publish({7: patch});
+
+      // Three launches, not one. A single launch passes even when the refusal
+      // leaves a boot token behind, because the crash-loop guard needs two
+      // attempts before it acts — so the version of this test that ran once
+      // was blind to the patch being condemned on the third launch under the
+      // wrong reason.
+      for (var launch = 0; launch < 3; launch++) {
+        final v1 = makeClient();
+        await v1.start();
+        await v1.checkForUpdate();
+        expect(v1.activePatch, 0);
+        expect(v1.state.blocklist, isNot(contains(7)),
+            reason: 'launch ${launch + 1} must not condemn a patch this build '
+                'merely cannot read');
+        v1.dispose();
+        Patch.resetForTesting();
+      }
+
+      // The store update: same storage, same manifest, a patch this build can
+      // read. Publishing under the same number is what a real forward-compat
+      // rollout looks like from the device's side.
+      await cdn.publish({7: await cdn.buildPatch(_patchSource)});
+      final v2 = makeClient();
+      await v2.start();
+      await v2.checkForUpdate();
+
+      expect(v2.activePatch, 7,
+          reason: 'the earlier refusal must not have poisoned patch 7');
+      v2.dispose();
     });
 
     test('a manifest signed by the wrong key is ignored', () async {
@@ -592,6 +693,67 @@ void main() {
           bootAttempts: 0,
           manifestEtag: null,
           lastSequence: 1);
+    });
+
+    test('a patch that gives up mid-launch does not confirm the boot',
+        () async {
+      // How an async patch used to become immortal. The first async failure
+      // drops the patch for the session and resets the failure count in the
+      // same breath, so the runtime threshold is unreachable by construction.
+      // If the auto-confirm timer then cleared the boot token anyway, nothing
+      // accumulated across launches either and the patch was retried forever.
+      //
+      // `Patch.deactivate()` here stands in for that: a patch that was running
+      // and is not any more, whatever dropped it.
+      await cdn.publish({7: await cdn.buildPatch(_patchSource)});
+
+      final client = makeClient();
+      await client.start();
+      await client.checkForUpdate();
+      expect(client.activePatch, 7);
+
+      Patch.deactivate();
+      await client.markBootSuccessful();
+
+      expect(client.state.booting, 7,
+          reason: 'the token must survive so the next launch counts an '
+              'attempt against the crash-loop budget');
+      client.dispose();
+    });
+
+    test('a stored patch from an older build is refused, never condemned',
+        () async {
+      // Where the boot-token leak actually bit. `_activateStored` writes the
+      // token *before* opening the patch — deliberately, so an OOM during
+      // decompression is still counted — and the ABI refusal is not a
+      // blocklist, so nothing cleared it. The guard then condemned the patch on
+      // the third launch as `failed to boot 2 times`, which is both permanent
+      // and untrue: it never booted, it was never for this binary.
+      await cdn.publish({7: await cdn.buildPatch(_patchSource)});
+
+      final installed = makeClient();
+      await installed.start();
+      await installed.checkForUpdate();
+      expect(installed.activePatch, 7);
+      installed.dispose();
+      Patch.resetForTesting();
+
+      // The store update: same device, same file on disk, a build whose
+      // patchable surface has moved.
+      final otherAbi = 'sha256:${'ab' * 32}';
+      for (var launch = 0; launch < 3; launch++) {
+        final client = makeClient(abi: otherAbi);
+        await client.start();
+        expect(client.activePatch, 0, reason: 'it cannot run here');
+        expect(client.state.blocklist, isEmpty,
+            reason: 'launch ${launch + 1}: a patch built for another binary is '
+                'not a patch that failed');
+        expect(client.state.booting, isNull,
+            reason: 'the token written before opening it must be cleared, or '
+                'the crash-loop guard counts a boot that never happened');
+        client.dispose();
+        Patch.resetForTesting();
+      }
     });
 
     test('a blocklisted patch is not reinstalled from the same manifest',

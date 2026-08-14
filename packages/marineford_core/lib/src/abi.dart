@@ -115,6 +115,14 @@ final class AbiFingerprint {
     return true;
   }
 
+  /// Recomputed on every call, deliberately.
+  ///
+  /// Caching it in a `late final` is the obvious move and does not compile:
+  /// this class has a const constructor, and a class with one cannot hold a
+  /// late final field. Between a const fingerprint and a memoised hash of 32
+  /// bytes, the constructor is worth more — this is reached through
+  /// `PatchEntry.hashCode`, and a manifest holds a handful of entries, not a
+  /// hot loop.
   @override
   int get hashCode => Object.hashAll(_bytes);
 }

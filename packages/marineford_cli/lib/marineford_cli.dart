@@ -12,7 +12,12 @@ library;
 
 export 'src/builder.dart' show BuiltPatch, PatchBuilder;
 export 'src/commands.dart'
-    show Console, MarinefordCommands, RecordingConsole, StdoutConsole;
+    show
+        Console,
+        MarinefordCommands,
+        RecordingConsole,
+        StderrConsole,
+        StdoutConsole;
 export 'src/config.dart'
     show CliException, MarinefordIdRegistry, MarinefordProject;
 export 'src/lint.dart' show LintFinding, LintSeverity, PatchLinter;
