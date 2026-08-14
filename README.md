@@ -27,8 +27,9 @@ function with the bug never has to be the function you marked. The
 one function, repairing six and correctly leaving two alone, and repairs the
 card that draws the result from the same patch.
 
-> **Status: pre-release.** Not on pub.dev yet. The pipeline works end to end and
-> is covered by 457 tests; the API may still move before 0.1.0.
+> **Status: 0.1.0, the first release.** The pipeline works end to end and is
+> covered by 460 tests. Treat the API as settled enough to build on and not yet
+> settled enough to be surprised by a breaking 0.2.0.
 
 ---
 
@@ -125,8 +126,8 @@ dart pub global activate marineford_cli
 
 It installs as `marineford`, and as `mf` for short.
 
-Until the packages are on pub.dev, activate from a checkout instead, and use
-`path:` dependencies in step 2:
+To work against this repository instead of the published version, activate from
+the checkout and use `path:` dependencies in step 2:
 
 ```bash
 dart pub global activate --source path packages/marineford_cli

@@ -3,7 +3,7 @@ description: >-
   Command line tool for marineford. Generates signing keys, compiles and
   signs patches, lints them against the measured cost model, and publishes them
   to a local folder you can sync anywhere.
-version: 0.1.0-dev
+version: 0.1.0
 repository: https://github.com/yusufkecer/marineford/tree/main/packages/marineford_cli
 issue_tracker: https://github.com/yusufkecer/marineford/issues
 topics:
@@ -25,7 +25,7 @@ dependencies:
   args: ^2.6.0
   crypto: ^3.0.6
   dart_eval: ^0.8.5
-  marineford_core: ^0.1.0-dev
+  marineford_core: ^0.1.0
   path: ^1.9.0
   pub_semver: ^2.1.5
   yaml: ^3.1.2

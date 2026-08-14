@@ -1,8 +1,13 @@
-## 0.1.0-dev
+## 0.1.0
 
-- Manifest modeli ve savunmacı JSON parse (`PatchManifest`, `PatchEntry`).
-- `.mfp` patch konteyneri: framing, ileri uyumluluk için flag reddi.
-- Ed25519 imza doğrulama ve imzalama (`PatchVerifier`, `PatchSigner`).
-- Patch seçim algoritması: ABI eşleşmesi, sürüm kısıtı, revoke, yerel
-  blocklist, downgrade koruması, kademeli rollout.
-- Deterministik rollout kovası (`rolloutBucket`, `isInRollout`).
+First release. The rules both the device and the publisher check, in one place
+so they cannot disagree.
+
+- `PatchManifest` and `PatchEntry`, with a defensive JSON parse.
+- The `.mfp` patch container: framing, and a flag it does not recognise is
+  refused rather than ignored.
+- Ed25519 signing and verification (`PatchSigner`, `PatchVerifier`).
+- Patch selection: ABI match, version constraint, revocation, local blocklist,
+  downgrade protection, staged rollout — as one pure function, so the CLI can
+  answer "what would devices do" without guessing.
+- Deterministic rollout bucketing (`rolloutBucket`, `isInRollout`).

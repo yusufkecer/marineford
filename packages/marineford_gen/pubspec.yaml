@@ -3,7 +3,7 @@ description: >-
   build_runner code generator for marineford. Turns @patchable and
   @PatchableService into zero-overhead dispatch shims, and computes the ABI
   fingerprint that keeps patches from being applied to the wrong build.
-version: 0.1.0-dev
+version: 0.1.0
 repository: https://github.com/yusufkecer/marineford/tree/main/packages/marineford_gen
 issue_tracker: https://github.com/yusufkecer/marineford/issues
 topics:

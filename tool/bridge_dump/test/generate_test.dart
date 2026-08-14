@@ -45,7 +45,8 @@ void main() {
     final packed = base64.encode(gzip.encode(utf8.encode(json)));
     final version = _flutterEvalVersion();
 
-    final out = File('../../packages/marineford_cli/lib/src/flutter_bridge.g.dart');
+    final out =
+        File('../../packages/marineford_cli/lib/src/flutter_bridge.g.dart');
     out.writeAsStringSync(_render(packed, version, recorder));
 
     // ignore: avoid_print
@@ -66,18 +67,24 @@ void main() {
 /// declarations disagree with an app's flutter_eval.
 String _flutterEvalVersion() {
   final lock = File('pubspec.lock').readAsStringSync();
-  final match = RegExp(r'flutter_eval:[\s\S]{0,400}?version: "([^"]+)"')
-      .firstMatch(lock);
+  final match =
+      RegExp(r'flutter_eval:[\s\S]{0,400}?version: "([^"]+)"').firstMatch(lock);
   return match?.group(1) ?? 'unknown';
 }
 
+/// Emits the file already formatted.
+///
+/// `dart format` cannot split a string literal but it does move the assignment
+/// off the declaration line, so a template that ignored this left the tree
+/// dirty after every run of the tool — which reads as an uncommitted change
+/// nobody made.
 String _render(String packed, String version, _Recorder recorder) => '''
 // GENERATED — do not edit. Regenerate with: flutter test tool/bridge_dump
 //
-// flutter_eval $version: ${recorder.classes.length} classes,
-// ${recorder.enums.length} enums, ${recorder.functions.length} top-level
-// functions, ${recorder.sources.length} sources, ${recorder.exports.length}
-// export mappings.
+// flutter_eval $version: ${recorder.classes.length} classes, '''
+    '''${recorder.enums.length} enums, ${recorder.functions.length} top-level '''
+    '''functions, ${recorder.sources.length} sources, '''
+    '''${recorder.exports.length} export mappings.
 //
 // gzipped and base64'd because this is 800 KB of JSON in the raw, and a Dart
 // source file that large is slow to parse on every CLI start. Unpacked lazily,
@@ -87,7 +94,8 @@ String _render(String packed, String version, _Recorder recorder) => '''
 const String kFlutterBridgeVersion = '$version';
 
 /// flutter_eval's compile-time bridge declarations, gzipped and base64 encoded.
-const String kFlutterBridgeData = '$packed';
+const String kFlutterBridgeData =
+    '$packed';
 ''';
 
 /// Records what a plugin registers, instead of compiling with it.

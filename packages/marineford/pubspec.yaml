@@ -3,7 +3,7 @@ description: >-
   Code push for Flutter without forking the engine. Mark the functions you want
   to be able to fix later, ship a signed patch to any CDN, and repair broken
   logic without a store release.
-version: 0.1.0-dev
+version: 0.1.0
 repository: https://github.com/yusufkecer/marineford/tree/main/packages/marineford
 issue_tracker: https://github.com/yusufkecer/marineford/issues
 topics:
@@ -23,7 +23,7 @@ dependencies:
   flutter:
     sdk: flutter
   http: ^1.2.0
-  marineford_core: ^0.1.0-dev
+  marineford_core: ^0.1.0
   meta: ^1.15.0
   path: ^1.9.0
   path_provider: ^2.1.4

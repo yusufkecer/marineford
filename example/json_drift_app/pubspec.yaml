@@ -18,7 +18,7 @@ dependencies:
   # so a patch can build widgets. Nothing in `marineford` pulls this in — an
   # app that only patches logic never pays for it.
   flutter_eval: ^0.8.2
-  marineford: ^0.1.0-dev
+  marineford: ^0.1.0
   pub_semver: ^2.1.5
 
 dev_dependencies:
@@ -26,9 +26,9 @@ dev_dependencies:
   flutter_test:
     sdk: flutter
   lints: ^6.0.0
-  marineford_cli: ^0.1.0-dev
+  marineford_cli: ^0.1.0
   # Only the tests reach for it; the app itself gets what it needs through
   # `marineford`, which re-exports the core types a caller touches.
-  marineford_core: ^0.1.0-dev
-  marineford_gen: ^0.1.0-dev
+  marineford_core: ^0.1.0
+  marineford_gen: ^0.1.0
   path: ^1.9.0

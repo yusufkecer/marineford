@@ -10,5 +10,5 @@ resolution: workspace
 
 dependencies:
   dart_eval: ^0.8.5
-  marineford_core: ^0.1.0-dev
+  marineford_core: ^0.1.0
   pub_semver: ^2.1.5

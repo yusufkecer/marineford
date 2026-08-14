@@ -133,8 +133,10 @@ Widget orderCard(Map<String, dynamic> data) {
       isNull,
       reason: 'the patch must fail and fall back, not fetch',
     );
-    expect(Patch.failureCount, greaterThan(0),
-        reason: 'and the failure must be counted, so it eventually deactivates',
+    expect(
+      Patch.failureCount,
+      greaterThan(0),
+      reason: 'and the failure must be counted, so it eventually deactivates',
     );
   });
 
